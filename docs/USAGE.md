@@ -28,7 +28,7 @@ cargo install sxmc
 Or build from source:
 
 ```bash
-git clone https://github.com/aihxp/sumac.git
+git clone https://github.com/hannsxpeter/sumac.git
 cd sumac
 cargo build --release
 ```

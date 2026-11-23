@@ -20,7 +20,7 @@ const archiveName = `sxmc-${releaseTag}-${target.assetId}.${target.archiveExt}`;
 const checksumName = `${archiveName}.sha256`;
 const downloadBase =
   process.env.SXMC_NPM_DOWNLOAD_BASE ??
-  `https://github.com/aihxp/sumac/releases/download/${releaseTag}`;
+  `https://github.com/hannsxpeter/sumac/releases/download/${releaseTag}`;
 const url = `${downloadBase}/${archiveName}`;
 const checksumUrl = `${downloadBase}/${checksumName}`;
 
