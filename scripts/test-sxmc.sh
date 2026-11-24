@@ -520,7 +520,34 @@ fi
 # ── Section 14: Self-Dogfooding ──
 section "14. Self-Dogfooding"
 
-DOGFOOD_FILES=(CLAUDE.md AGENTS.md GEMINI.md .cursor/rules/sxmc-cli-ai.md .github/copilot-instructions.md)
+verify_dogfood_claude_md() {
+  local repo_root="$1"
+  local claude_file="$repo_root/CLAUDE.md"
+  local agents_file="$repo_root/AGENTS.md"
+  [ -f "$agents_file" ] && grep -qi "sxmc" "$agents_file" || return 1
+  if [ -L "$claude_file" ]; then
+    python3 - "$claude_file" "$agents_file" <<'PY'
+import os, sys
+raise SystemExit(0 if os.path.realpath(sys.argv[1]) == os.path.realpath(sys.argv[2]) else 1)
+PY
+    return $?
+  fi
+  [ -f "$claude_file" ] || return 1
+  python3 - "$claude_file" <<'PY'
+from pathlib import Path
+import sys
+raw = Path(sys.argv[1]).read_bytes()
+raise SystemExit(0 if raw in (b"@AGENTS.md", b"@AGENTS.md\n", b"@AGENTS.md\r\n") else 1)
+PY
+}
+
+if verify_dogfood_claude_md "$ROOT"; then
+  pass "repo ships CLAUDE.md"
+else
+  fail "repo missing or incomplete CLAUDE.md"
+fi
+
+DOGFOOD_FILES=(AGENTS.md GEMINI.md .cursor/rules/sxmc-cli-ai.md .github/copilot-instructions.md)
 for f in "${DOGFOOD_FILES[@]}"; do
   if [ -f "$ROOT/$f" ] && grep -qi "sxmc" "$ROOT/$f"; then
     pass "repo ships $f"
@@ -1643,7 +1670,19 @@ for cmd in "${MATRIX_CLIS[@]}"; do
     ai_cmd+=( --allow-low-confidence )
   fi
   ai_out=$("${ai_cmd[@]}" 2>&1)
-  grep -q "Target:" <<<"$ai_out" && pass "$cmd: init ai claude-code" || fail "$cmd: init ai"
+  ai_status=$?
+  if [[ "$cmd" == find && "$IS_WINDOWS" -eq 0 && "$ai_status" -ne 0 &&
+        "$ai_out" == *"Refusing to generate startup-facing agent docs from a low-confidence CLI profile."* &&
+        "$ai_out" == *"Use --allow-low-confidence"* ]] && ! grep -q '^Target:' <<<"$ai_out"; then
+    pass "$cmd: init ai refuses a low-confidence profile"
+    ai_out=$("${ai_cmd[@]}" --allow-low-confidence 2>&1)
+    ai_status=$?
+  fi
+  if [ "$ai_status" -eq 0 ] && grep -q '^Target:' <<<"$ai_out"; then
+    pass "$cmd: init ai claude-code"
+  else
+    fail "$cmd: init ai" "Exit $ai_status"$'\n'"$ai_out"
+  fi
 
   ((CLI_PASS++))
 done

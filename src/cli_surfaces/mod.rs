@@ -15,8 +15,8 @@ pub use materialize::{
     generate_full_coverage_init_artifacts, generate_host_native_agent_doc_artifacts,
     generate_llms_txt_artifact, generate_mcp_wrapper_artifacts,
     generate_portable_agent_doc_artifact, generate_profile_artifact, generate_skill_artifacts,
-    materialize_artifacts, materialize_artifacts_with_apply_selection, preview_artifacts,
-    preview_artifacts_with_apply_selection, remove_artifacts,
+    has_managed_toml_block, materialize_artifacts, materialize_artifacts_with_apply_selection,
+    preview_artifacts, preview_artifacts_with_apply_selection, remove_artifacts,
     remove_artifacts_with_apply_selection,
 };
 pub use model::{
@@ -25,3 +25,4 @@ pub use model::{
     ProfileOption, ProfilePositional, ProfileQualityReport, WriteOutcome, WriteStatus,
     AI_HOST_SPECS, CLI_AI_HOSTS_LAST_VERIFIED, PROFILE_SCHEMA,
 };
+pub use render::render_codex_mcp_server_toml;

@@ -254,6 +254,36 @@ jobs:
     )
 }
 
+pub fn format_toml_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        key.to_string()
+    } else {
+        toml::Value::String(key.to_string()).to_string()
+    }
+}
+
+pub fn render_codex_mcp_server_toml(
+    header_comment: &str,
+    server_name: &str,
+    command: &str,
+    args: &[String],
+) -> String {
+    let key = format_toml_key(server_name);
+    let command_literal = toml::Value::String(command.to_string()).to_string();
+    let args_literals = args
+        .iter()
+        .map(|arg| toml::Value::String(arg.clone()).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{header_comment}\n[mcp_servers.{key}]\ncommand = {command_literal}\nargs = [{args_literals}]\n"
+    )
+}
+
 pub(crate) fn render_client_config(
     client: AiClientProfile,
     server_name: &str,
@@ -261,8 +291,11 @@ pub(crate) fn render_client_config(
 ) -> String {
     let skills_display = skills_path.display().to_string();
     match client {
-        AiClientProfile::OpenaiCodex => format!(
-            "# sxmc CLI->AI startup scaffold\n[mcp_servers.{server_name}]\ncommand = \"sxmc\"\nargs = [\"serve\", \"--paths\", \"{skills_display}\"]\n"
+        AiClientProfile::OpenaiCodex => render_codex_mcp_server_toml(
+            "# sxmc CLI->AI startup scaffold",
+            server_name,
+            "sxmc",
+            &["serve".into(), "--paths".into(), skills_display],
         ),
         AiClientProfile::GenericHttpMcp => serde_json::to_string_pretty(&json!({
             "mcpServers": {

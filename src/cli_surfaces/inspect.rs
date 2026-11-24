@@ -14,13 +14,13 @@ use serde_json::{json, Value};
 use crate::cache::Cache;
 use crate::cli_surfaces::model::{
     AuthRequirement, CliSurfaceProfile, ConfidenceLevel, ConfidenceNote, EnvironmentRequirement,
-    OutputBehavior, ProfileExample, ProfileOption, ProfilePositional, ProfileSource,
-    ProfileSubcommand, Provenance, Workflow, PROFILE_SCHEMA,
+    OptionRequirementSource, OutputBehavior, ProfileExample, ProfileOption, ProfilePositional,
+    ProfileSource, ProfileSubcommand, Provenance, Workflow, PROFILE_SCHEMA,
 };
 use crate::error::{Result, SxmcError};
 
 const CLI_PROFILE_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 14;
-const CLI_PROFILE_CACHE_SCHEMA_VERSION: u32 = 6;
+const CLI_PROFILE_CACHE_SCHEMA_VERSION: u32 = 8;
 const COMPACT_SUBCOMMAND_LIMIT: usize = 12;
 const COMPACT_OPTION_LIMIT: usize = 15;
 
@@ -681,6 +681,45 @@ pub fn load_profile(path: &Path) -> Result<CliSurfaceProfile> {
     })
 }
 
+fn collect_profile_nodes<'a>(
+    profile: &'a CliSurfaceProfile,
+    parent_path: &[String],
+    root_command: &str,
+    out: &mut std::collections::BTreeMap<Vec<String>, (String, &'a [ProfileOption])>,
+) {
+    let display_command = if parent_path.is_empty() {
+        profile.command.clone()
+    } else {
+        format!("{} {}", root_command, parent_path.join(" "))
+    };
+    out.entry(parent_path.to_vec())
+        .or_insert((display_command, profile.options.as_slice()));
+    for child in &profile.subcommand_profiles {
+        let rel = inspect_relative_subcommand_path(&profile.command, &child.command);
+        let mut child_path = parent_path.to_vec();
+        child_path.extend(rel);
+        collect_profile_nodes(child, &child_path, root_command, out);
+    }
+}
+
+fn index_options_by_name(
+    options: &[ProfileOption],
+) -> std::collections::BTreeMap<&str, &ProfileOption> {
+    let mut map = std::collections::BTreeMap::new();
+    for option in options {
+        map.entry(option.name.as_str()).or_insert(option);
+    }
+    map
+}
+
+fn format_scoped_option(command_path: &[String], name: &str) -> String {
+    if command_path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{} {}", command_path.join(" "), name)
+    }
+}
+
 pub fn diff_profile_value(before: &CliSurfaceProfile, after: &CliSurfaceProfile) -> Value {
     let before_subcommands = before
         .subcommands
@@ -692,16 +731,105 @@ pub fn diff_profile_value(before: &CliSurfaceProfile, after: &CliSurfaceProfile)
         .iter()
         .map(|item| item.name.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let before_options = before
-        .options
-        .iter()
-        .map(|item| item.name.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let after_options = after
-        .options
-        .iter()
-        .map(|item| item.name.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+    let mut before_nodes = std::collections::BTreeMap::new();
+    collect_profile_nodes(before, &[], &before.command, &mut before_nodes);
+    let mut after_nodes = std::collections::BTreeMap::new();
+    collect_profile_nodes(after, &[], &after.command, &mut after_nodes);
+
+    let mut options_added = Vec::new();
+    let mut options_removed = Vec::new();
+    let mut nested_options_added = Vec::new();
+    let mut nested_options_removed = Vec::new();
+    let mut options_became_required = Vec::new();
+    let mut options_became_optional = Vec::new();
+    let mut option_changes = Vec::new();
+
+    // Only compare command paths inspected in both profiles so coverage/depth changes
+    // do not misreport uninspected child flags as added or removed.
+    for (command_path, (before_cmd, before_opts)) in &before_nodes {
+        let Some((after_cmd, after_opts)) = after_nodes.get(command_path) else {
+            continue;
+        };
+        let before_by_name = index_options_by_name(before_opts);
+        let after_by_name = index_options_by_name(after_opts);
+        let all_names: std::collections::BTreeSet<&str> = before_by_name
+            .keys()
+            .chain(after_by_name.keys())
+            .copied()
+            .collect();
+
+        for name in all_names {
+            match (before_by_name.get(name), after_by_name.get(name)) {
+                (None, Some(after_opt)) => {
+                    if command_path.is_empty() {
+                        options_added.push(name.to_string());
+                    } else {
+                        nested_options_added.push(format_scoped_option(command_path, name));
+                    }
+                    option_changes.push(json!({
+                        "command_path": command_path,
+                        "command": after_cmd,
+                        "name": name,
+                        "change": "added",
+                        "before_required": Value::Null,
+                        "after_required": after_opt.known_required(),
+                        "before_required_source": Value::Null,
+                        "after_required_source": after_opt.required_source,
+                    }));
+                }
+                (Some(before_opt), None) => {
+                    if command_path.is_empty() {
+                        options_removed.push(name.to_string());
+                    } else {
+                        nested_options_removed.push(format_scoped_option(command_path, name));
+                    }
+                    option_changes.push(json!({
+                        "command_path": command_path,
+                        "command": before_cmd,
+                        "name": name,
+                        "change": "removed",
+                        "before_required": before_opt.known_required(),
+                        "after_required": Value::Null,
+                        "before_required_source": before_opt.required_source,
+                        "after_required_source": Value::Null,
+                    }));
+                }
+                (Some(before_opt), Some(after_opt)) => {
+                    match (before_opt.known_required(), after_opt.known_required()) {
+                        (Some(false), Some(true)) => {
+                            options_became_required.push(format_scoped_option(command_path, name));
+                            option_changes.push(json!({
+                                "command_path": command_path,
+                                "command": after_cmd,
+                                "name": name,
+                                "change": "became_required",
+                                "before_required": false,
+                                "after_required": true,
+                                "before_required_source": before_opt.required_source,
+                                "after_required_source": after_opt.required_source,
+                            }));
+                        }
+                        (Some(true), Some(false)) => {
+                            options_became_optional.push(format_scoped_option(command_path, name));
+                            option_changes.push(json!({
+                                "command_path": command_path,
+                                "command": after_cmd,
+                                "name": name,
+                                "change": "became_optional",
+                                "before_required": true,
+                                "after_required": false,
+                                "before_required_source": before_opt.required_source,
+                                "after_required_source": after_opt.required_source,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+    }
+
     let before_env = before
         .environment
         .iter()
@@ -724,8 +852,13 @@ pub fn diff_profile_value(before: &CliSurfaceProfile, after: &CliSurfaceProfile)
         "description_changed": before.description != after.description,
         "subcommands_added": after_subcommands.difference(&before_subcommands).cloned().collect::<Vec<_>>(),
         "subcommands_removed": before_subcommands.difference(&after_subcommands).cloned().collect::<Vec<_>>(),
-        "options_added": after_options.difference(&before_options).cloned().collect::<Vec<_>>(),
-        "options_removed": before_options.difference(&after_options).cloned().collect::<Vec<_>>(),
+        "options_added": options_added,
+        "options_removed": options_removed,
+        "nested_options_added": nested_options_added,
+        "nested_options_removed": nested_options_removed,
+        "options_became_required": options_became_required,
+        "options_became_optional": options_became_optional,
+        "option_changes": option_changes,
         "environment_added": after_env.difference(&before_env).cloned().collect::<Vec<_>>(),
         "environment_removed": before_env.difference(&after_env).cloned().collect::<Vec<_>>(),
         "before_generator_version": before.provenance.generator_version,
@@ -798,7 +931,7 @@ pub fn compact_profile_value(profile: &CliSurfaceProfile) -> Value {
                 "name": option.name,
                 "short": option.short,
                 "value_name": option.value_name,
-                "required": option.required,
+                "required": option.known_required(),
             })
         }).collect::<Vec<_>>(),
         "positionals": profile.positionals.iter().take(8).map(|positional| {
@@ -1177,6 +1310,29 @@ fn merge_profile_options(options: &mut Vec<ProfileOption>, candidates: Vec<Profi
                     > existing.summary.as_ref().map(|s| s.len()).unwrap_or(0)
             {
                 existing.summary = candidate.summary.clone();
+            }
+            if existing.required_source.is_none() && candidate.required_source.is_some() {
+                existing.required = candidate.required;
+                existing.required_known = candidate.required_known;
+                existing.required_source = candidate.required_source;
+            } else if let (Some(ex_req), Some(cand_req)) =
+                (existing.known_required(), candidate.known_required())
+            {
+                if ex_req != cand_req {
+                    existing.required = false;
+                    existing.required_known = false;
+                    existing.required_source = Some(OptionRequirementSource::UsageAmbiguous);
+                }
+            } else if existing.known_required().is_none()
+                && existing.required_source != Some(OptionRequirementSource::UsageAmbiguous)
+            {
+                if let Some(cand_req) = candidate.known_required() {
+                    existing.required = cand_req;
+                    existing.required_known = true;
+                    if existing.required_source.is_none() {
+                        existing.required_source = candidate.required_source;
+                    }
+                }
             }
             if matches!(existing.confidence, ConfidenceLevel::Low)
                 && !matches!(candidate.confidence, ConfidenceLevel::Low)
@@ -1726,19 +1882,26 @@ fn parse_options(lines: &[&str], command_name: &str) -> Vec<ProfileOption> {
             }
         }
     }
+    let usage_options = parse_usage_options(lines, command_name);
     if options.is_empty() {
-        options.extend(parse_usage_options(lines, command_name));
+        options.extend(usage_options);
+    } else {
+        apply_usage_option_evidence(&mut options, &usage_options);
     }
     if options.is_empty() {
         options.extend(parse_inline_options(lines));
     }
-    if options.is_empty() && looks_like_man_page(lines) {
-        options.extend(parse_man_synopsis_options(lines));
-    }
-    if looks_like_man_page(lines) {
+    let man_page = looks_like_man_page(lines);
+    if man_page {
+        let synopsis_options = parse_man_synopsis_options(lines);
         let man_options = parse_man_options(lines);
         if man_options.len() > options.len() {
-            return man_options;
+            options = man_options;
+        }
+        if options.is_empty() {
+            options.extend(synopsis_options);
+        } else {
+            apply_usage_option_evidence(&mut options, &synopsis_options);
         }
     }
 
@@ -2084,14 +2247,20 @@ fn infer_output_behavior(help: &str) -> OutputBehavior {
 }
 
 fn is_named_section(line: &str, headings: &[&str]) -> bool {
-    let normalized = line
-        .trim()
+    let trimmed = line.trim();
+    let normalized = trimmed
         .trim_end_matches(':')
         .replace('_', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase();
+    if headings.iter().any(|heading| normalized == *heading) {
+        return true;
+    }
+    if !is_major_section_heading(trimmed) {
+        return false;
+    }
     headings.iter().any(|heading| {
         normalized == *heading
             || normalized.contains(heading)
@@ -2145,6 +2314,12 @@ fn is_command_section_heading(line: &str, man_page: bool) -> bool {
     let trimmed = line.trim();
     let normalized = normalize_heading(trimmed);
     if normalized.starts_with("the command") || normalized.starts_with("this command") {
+        return false;
+    }
+
+    if !(is_major_section_heading(trimmed)
+        || matches!(normalized.as_str(), "commands" | "subcommands"))
+    {
         return false;
     }
 
@@ -2448,80 +2623,7 @@ fn parse_man_options(lines: &[&str]) -> Vec<ProfileOption> {
 }
 
 fn parse_man_synopsis_options(lines: &[&str]) -> Vec<ProfileOption> {
-    let mut options = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut in_synopsis = false;
-    let short_regex =
-        Regex::new(r"(^|[\[(\s|])(-[A-Za-z0-9?])(?:\s+([A-Za-z<>\[\]_.=-]+))?").unwrap();
-    let long_regex =
-        Regex::new(r"(^|[\[(\s|])(--[A-Za-z0-9][A-Za-z0-9-]*)(?:[ =]([A-Za-z<>\[\]_.=-]+))?")
-            .unwrap();
-
-    for line in lines {
-        let trimmed = line.trim();
-        if matches_normalized_heading(trimmed, "synopsis") {
-            in_synopsis = true;
-            continue;
-        }
-        if !in_synopsis {
-            continue;
-        }
-        if trimmed.is_empty() {
-            if !options.is_empty() {
-                break;
-            }
-            continue;
-        }
-        if is_major_section_heading(trimmed) && !matches_normalized_heading(trimmed, "synopsis") {
-            break;
-        }
-
-        for caps in short_regex.captures_iter(trimmed) {
-            let short = caps
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            if short.is_empty() || !seen.insert(short.clone()) {
-                continue;
-            }
-            let value_name = caps
-                .get(3)
-                .map(|m| m.as_str().trim_matches(&['<', '>'][..]).to_string())
-                .filter(|value| !value.starts_with('-'));
-            options.push(ProfileOption {
-                name: short.clone(),
-                short: Some(short),
-                value_name,
-                required: false,
-                summary: Some("Inferred from the CLI synopsis.".into()),
-                confidence: ConfidenceLevel::Medium,
-            });
-        }
-
-        for caps in long_regex.captures_iter(trimmed) {
-            let name = caps
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            if name.is_empty() || !seen.insert(name.clone()) {
-                continue;
-            }
-            let value_name = caps
-                .get(3)
-                .map(|m| m.as_str().trim_matches(&['<', '>'][..]).to_string())
-                .filter(|value| !value.starts_with('-'));
-            options.push(ProfileOption {
-                name,
-                short: None,
-                value_name,
-                required: false,
-                summary: Some("Inferred from the CLI synopsis.".into()),
-                confidence: ConfidenceLevel::Medium,
-            });
-        }
-    }
-
-    options
+    analyze_usage_options(lines, "", true)
 }
 
 fn parse_subcommand_row(
@@ -2782,60 +2884,616 @@ fn parse_invocation_subcommands(lines: &[&str], command_name: &str) -> Vec<Profi
     inferred
 }
 
-fn parse_usage_options(lines: &[&str], command_name: &str) -> Vec<ProfileOption> {
-    let mut inferred = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut in_usage_block = false;
-    let mut saw_usage_content = false;
-    let option_regex = Regex::new(r"(?P<opt>--[A-Za-z0-9][A-Za-z0-9-]*|-[A-Za-z0-9?])").unwrap();
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum UsageGroupKind {
+    Square,
+    Paren,
+    Brace,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct UsageGroupFrame {
+    id: usize,
+    kind: UsageGroupKind,
+    has_pipe: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum UsageOccurrenceState {
+    Optional,
+    Compulsory,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone)]
+struct UsageFlagOccurrence {
+    flag: String,
+    value_name: Option<String>,
+    in_square: bool,
+    in_brace: bool,
+    enclosing_paren_ids: Vec<usize>,
+    state: UsageOccurrenceState,
+}
+
+fn strip_case_insensitive_usage_prefix(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("usage:"))
+    {
+        Some(trimmed[6..].trim())
+    } else {
+        None
+    }
+}
+
+fn starts_new_usage_invocation(line: &str, command_name: &str, first_prefix: Option<&str>) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('[')
+        || trimmed.starts_with('<')
+        || trimmed.starts_with('-')
+        || trimmed.starts_with('(')
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('|')
+        || trimmed.starts_with("...")
+    {
+        return false;
+    }
+
+    let check_prefix = |prefix: &str| -> bool {
+        if prefix.is_empty() {
+            return false;
+        }
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.is_empty() || rest.starts_with(char::is_whitespace);
+        }
+        if let Some(first_tok) = trimmed.split_whitespace().next() {
+            if first_tok.ends_with(&format!("/{prefix}")) {
+                return true;
+            }
+        }
+        false
+    };
+
+    if first_prefix.is_some_and(check_prefix) {
+        return true;
+    }
+    check_prefix(command_name)
+}
+
+fn extract_usage_prefix(invocation: &str) -> Option<String> {
+    let mut prefix_tokens = Vec::new();
+    for token in invocation.split_whitespace() {
+        if token.starts_with('-')
+            || token.starts_with('[')
+            || token.starts_with('<')
+            || token.starts_with('(')
+            || token.starts_with('{')
+            || token == "|"
+        {
+            break;
+        }
+        prefix_tokens.push(token);
+        if prefix_tokens.len() >= 4 {
+            break;
+        }
+    }
+    if prefix_tokens.is_empty() {
+        None
+    } else {
+        Some(prefix_tokens.join(" "))
+    }
+}
+
+fn extract_usage_invocations(lines: &[&str], command_name: &str, synopsis: bool) -> Vec<String> {
+    let mut invocations: Vec<String> = Vec::new();
+    let mut first_prefix: Option<String> = None;
+    let mut in_block = false;
+    let mut saw_content = false;
 
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            if in_usage_block && !inferred.is_empty() {
+            if in_block && saw_content {
                 break;
             }
             continue;
         }
 
-        if in_usage_block
-            && is_major_section_heading(trimmed)
-            && !looks_like_usage_line(trimmed, command_name)
-        {
-            if saw_usage_content {
+        if !synopsis {
+            if let Some(rest) = strip_case_insensitive_usage_prefix(trimmed) {
+                in_block = true;
+                if !rest.is_empty() {
+                    saw_content = true;
+                    if first_prefix.is_none() {
+                        first_prefix = extract_usage_prefix(rest);
+                    }
+                    invocations.push(rest.to_string());
+                }
+                continue;
+            }
+            if matches_normalized_heading(trimmed, "usage") {
+                in_block = true;
+                continue;
+            }
+            if !in_block {
+                continue;
+            }
+            if is_major_section_heading(trimmed) && !looks_like_usage_line(trimmed, command_name) {
+                if saw_content {
+                    break;
+                }
+                continue;
+            }
+            if !saw_content && trimmed.ends_with(':') {
                 break;
             }
-            continue;
-        }
-
-        let usage_line = if let Some(rest) = trimmed.strip_prefix("Usage:") {
-            in_usage_block = true;
-            rest.trim()
-        } else if in_usage_block && looks_like_usage_continuation(trimmed, command_name) {
-            trimmed
         } else {
+            if matches_normalized_heading(trimmed, "synopsis") {
+                in_block = true;
+                continue;
+            }
+            if !in_block {
+                continue;
+            }
+            if is_major_section_heading(trimmed) && !matches_normalized_heading(trimmed, "synopsis")
+            {
+                break;
+            }
+        }
+
+        saw_content = true;
+        if invocations.is_empty()
+            || starts_new_usage_invocation(trimmed, command_name, first_prefix.as_deref())
+        {
+            if first_prefix.is_none() {
+                first_prefix = extract_usage_prefix(trimmed);
+            }
+            invocations.push(trimmed.to_string());
+        } else if let Some(last) = invocations.last_mut() {
+            last.push(' ');
+            last.push_str(trimmed);
+        }
+    }
+
+    invocations
+}
+
+fn is_flag_boundary_before(bytes: &[u8], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let prev = bytes[idx - 1];
+    prev.is_ascii_whitespace() || matches!(prev, b'[' | b'(' | b'{' | b'|' | b',')
+}
+
+fn clean_usage_value_name(raw: &str) -> Option<String> {
+    let cleaned = raw
+        .trim()
+        .trim_matches(&['<', '>', '[', ']', ','][..])
+        .trim();
+    if cleaned.is_empty() || cleaned.starts_with('-') || cleaned == "|" {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+fn looks_like_usage_operand_token(token: &str, synopsis: bool) -> bool {
+    let trimmed = token.trim_end_matches("...");
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed == "|"
+        || matches!(
+            trimmed.to_ascii_uppercase().as_str(),
+            "OPTIONS" | "FLAGS" | "COMMAND" | "SUBCOMMAND" | "ARGS"
+        )
+    {
+        return false;
+    }
+    if trimmed.starts_with('<') && trimmed.ends_with('>') {
+        return true;
+    }
+    let has_upper = trimmed.chars().any(|c| c.is_ascii_uppercase());
+    let all_caps_or_punct = trimmed.chars().all(|c| {
+        c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | ':' | '=')
+    });
+    if has_upper && all_caps_or_punct {
+        return true;
+    }
+    synopsis
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '='))
+}
+
+fn consume_attached_or_adjacent_operand(
+    inv: &str,
+    cursor: usize,
+    synopsis: bool,
+) -> (Option<String>, usize) {
+    let bytes = inv.as_bytes();
+    if cursor >= bytes.len() {
+        return (None, cursor);
+    }
+
+    // Handle `--flag=<VAL>` or `--flag=VAL`
+    if bytes[cursor] == b'=' {
+        let mut end = cursor + 1;
+        while end < bytes.len()
+            && !bytes[end].is_ascii_whitespace()
+            && !matches!(bytes[end], b']' | b')' | b'}' | b'|')
+        {
+            end += 1;
+        }
+        let val = clean_usage_value_name(&inv[cursor + 1..end]);
+        return (val, end);
+    }
+
+    // Handle `--flag[=<VAL>]`
+    if inv[cursor..].starts_with("[=") {
+        if let Some(close_rel) = inv[cursor..].find(']') {
+            let close = cursor + close_rel;
+            let val = clean_usage_value_name(&inv[cursor + 2..close]);
+            return (val, close + 1);
+        }
+    }
+
+    // Handle single-space separated operand (avoid multi-space description columns like `npm -l  display`).
+    if bytes[cursor] == b' ' && (cursor + 1 >= bytes.len() || bytes[cursor + 1] != b' ') {
+        let start = cursor + 1;
+        if bytes[start] == b'<' {
+            if let Some(close_rel) = inv[start..].find('>') {
+                let end = start + close_rel + 1;
+                let val = clean_usage_value_name(&inv[start..end]);
+                return (val, end);
+            }
+        }
+        if inv[start..].starts_with("[<") {
+            if let Some(close_rel) = inv[start..].find("]>") {
+                let end = start + close_rel + 2;
+                let val = clean_usage_value_name(&inv[start..end]);
+                return (val, end);
+            }
+            if let Some(close_rel) = inv[start..].find(']') {
+                let end = start + close_rel + 1;
+                let inner = &inv[start + 1..end - 1];
+                if inner.starts_with('<') && inner.ends_with('>') {
+                    return (clean_usage_value_name(inner), end);
+                }
+            }
+        }
+
+        let mut end = start;
+        while end < bytes.len()
+            && !bytes[end].is_ascii_whitespace()
+            && !matches!(bytes[end], b']' | b')' | b'}' | b'|')
+        {
+            end += 1;
+        }
+        let token = &inv[start..end];
+        if looks_like_usage_operand_token(token, synopsis) {
+            return (clean_usage_value_name(token), end);
+        }
+    }
+
+    (None, cursor)
+}
+
+fn scan_usage_invocation(inv: &str, synopsis: bool) -> Vec<UsageFlagOccurrence> {
+    let bytes = inv.as_bytes();
+    let mut stack: Vec<UsageGroupFrame> = Vec::new();
+    let mut next_group_id = 0usize;
+    let mut top_level_has_pipe = false;
+    let mut pipe_paren_ids = std::collections::BTreeSet::new();
+    let mut unbalanced = false;
+    let mut occurrences: Vec<UsageFlagOccurrence> = Vec::new();
+    let mut idx = 0usize;
+    let mut quote: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            idx += 1;
             continue;
-        };
+        }
+        if matches!(b, b'\'' | b'"') {
+            quote = Some(b);
+            idx += 1;
+            continue;
+        }
 
-        saw_usage_content = true;
-
-        for capture in option_regex.captures_iter(usage_line) {
-            let option = capture.name("opt").map(|m| m.as_str()).unwrap_or_default();
-            if seen.insert(option.to_string()) {
-                let short = (!option.starts_with("--")).then(|| option.to_string());
-                inferred.push(ProfileOption {
-                    name: option.to_string(),
-                    short,
-                    value_name: None,
-                    required: false,
-                    summary: Some("Inferred from the CLI usage line.".into()),
-                    confidence: ConfidenceLevel::Medium,
+        match b {
+            b'[' => {
+                stack.push(UsageGroupFrame {
+                    id: next_group_id,
+                    kind: UsageGroupKind::Square,
+                    has_pipe: false,
                 });
+                next_group_id += 1;
+                idx += 1;
+            }
+            b'(' => {
+                stack.push(UsageGroupFrame {
+                    id: next_group_id,
+                    kind: UsageGroupKind::Paren,
+                    has_pipe: false,
+                });
+                next_group_id += 1;
+                idx += 1;
+            }
+            b'{' => {
+                stack.push(UsageGroupFrame {
+                    id: next_group_id,
+                    kind: UsageGroupKind::Brace,
+                    has_pipe: false,
+                });
+                next_group_id += 1;
+                idx += 1;
+            }
+            b']' | b')' | b'}' => {
+                let expected = match b {
+                    b']' => UsageGroupKind::Square,
+                    b')' => UsageGroupKind::Paren,
+                    _ => UsageGroupKind::Brace,
+                };
+                match stack.pop() {
+                    Some(frame) if frame.kind == expected => {
+                        if frame.kind == UsageGroupKind::Paren && frame.has_pipe {
+                            pipe_paren_ids.insert(frame.id);
+                        }
+                    }
+                    _ => {
+                        unbalanced = true;
+                    }
+                }
+                idx += 1;
+            }
+            b'|' => {
+                if let Some(top) = stack.last_mut() {
+                    top.has_pipe = true;
+                } else {
+                    top_level_has_pipe = true;
+                }
+                idx += 1;
+            }
+            b'-' if is_flag_boundary_before(bytes, idx) => {
+                let mut flag_end = None;
+                if idx + 2 < bytes.len()
+                    && bytes[idx + 1] == b'-'
+                    && bytes[idx + 2].is_ascii_alphanumeric()
+                {
+                    let mut end = idx + 3;
+                    while end < bytes.len()
+                        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-')
+                    {
+                        end += 1;
+                    }
+                    flag_end = Some(end);
+                } else if idx + 1 < bytes.len()
+                    && (bytes[idx + 1].is_ascii_alphanumeric() || bytes[idx + 1] == b'?')
+                    && (idx + 2 >= bytes.len() || !bytes[idx + 2].is_ascii_alphanumeric())
+                {
+                    flag_end = Some(idx + 2);
+                }
+
+                if let Some(end) = flag_end {
+                    let flag = inv[idx..end].to_string();
+                    let in_square = stack.iter().any(|g| g.kind == UsageGroupKind::Square);
+                    let in_brace = stack.iter().any(|g| g.kind == UsageGroupKind::Brace);
+                    let enclosing_paren_ids = stack
+                        .iter()
+                        .filter(|g| g.kind == UsageGroupKind::Paren)
+                        .map(|g| g.id)
+                        .collect();
+                    let (value_name, next_idx) =
+                        consume_attached_or_adjacent_operand(inv, end, synopsis);
+                    occurrences.push(UsageFlagOccurrence {
+                        flag,
+                        value_name,
+                        in_square,
+                        in_brace,
+                        enclosing_paren_ids,
+                        state: UsageOccurrenceState::Ambiguous,
+                    });
+                    idx = next_idx;
+                } else {
+                    idx += 1;
+                }
+            }
+            _ => {
+                idx += 1;
             }
         }
     }
 
-    inferred
+    if !stack.is_empty() {
+        unbalanced = true;
+    }
+
+    for occ in &mut occurrences {
+        occ.state = if unbalanced {
+            UsageOccurrenceState::Ambiguous
+        } else if occ.in_square {
+            UsageOccurrenceState::Optional
+        } else if top_level_has_pipe
+            || occ.in_brace
+            || occ
+                .enclosing_paren_ids
+                .iter()
+                .any(|id| pipe_paren_ids.contains(id))
+        {
+            UsageOccurrenceState::Ambiguous
+        } else {
+            UsageOccurrenceState::Compulsory
+        };
+    }
+
+    occurrences
+}
+
+fn analyze_usage_options(lines: &[&str], command_name: &str, synopsis: bool) -> Vec<ProfileOption> {
+    let invocations = extract_usage_invocations(lines, command_name, synopsis);
+    if invocations.is_empty() {
+        return Vec::new();
+    }
+
+    let per_invocation: Vec<Vec<UsageFlagOccurrence>> = invocations
+        .iter()
+        .map(|inv| scan_usage_invocation(inv, synopsis))
+        .collect();
+    let total_invocations = per_invocation.len();
+
+    #[derive(Default)]
+    struct AggregateFlag {
+        value_name: Option<String>,
+        saw_optional: bool,
+        saw_ambiguous: bool,
+        compulsory_invocations: usize,
+    }
+
+    let mut order = Vec::new();
+    let mut agg_map: std::collections::HashMap<String, AggregateFlag> =
+        std::collections::HashMap::new();
+
+    for occs in &per_invocation {
+        let mut seen_compulsory_in_inv = std::collections::HashSet::new();
+        for occ in occs {
+            if !agg_map.contains_key(&occ.flag) {
+                order.push(occ.flag.clone());
+            }
+            let entry = agg_map.entry(occ.flag.clone()).or_default();
+            if entry.value_name.is_none() && occ.value_name.is_some() {
+                entry.value_name = occ.value_name.clone();
+            }
+            match occ.state {
+                UsageOccurrenceState::Optional => entry.saw_optional = true,
+                UsageOccurrenceState::Ambiguous => entry.saw_ambiguous = true,
+                UsageOccurrenceState::Compulsory => {
+                    if seen_compulsory_in_inv.insert(occ.flag.clone()) {
+                        entry.compulsory_invocations += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let summary_text = if synopsis {
+        "Inferred from the CLI synopsis."
+    } else {
+        "Inferred from the CLI usage line."
+    };
+
+    order
+        .into_iter()
+        .map(|flag| {
+            let agg = agg_map.remove(&flag).unwrap_or_default();
+            let (required, required_known, required_source) = if agg.saw_ambiguous {
+                (false, false, Some(OptionRequirementSource::UsageAmbiguous))
+            } else if agg.compulsory_invocations == total_invocations && !agg.saw_optional {
+                (true, true, Some(OptionRequirementSource::UsageCompulsory))
+            } else if agg.compulsory_invocations > 0 {
+                (false, false, Some(OptionRequirementSource::UsageAmbiguous))
+            } else {
+                (false, true, Some(OptionRequirementSource::UsageOptional))
+            };
+            let short = (!flag.starts_with("--")).then(|| flag.clone());
+            ProfileOption {
+                name: flag,
+                short,
+                value_name: agg.value_name,
+                required,
+                required_known,
+                required_source,
+                summary: Some(summary_text.into()),
+                confidence: ConfidenceLevel::Medium,
+            }
+        })
+        .collect()
+}
+
+fn apply_usage_option_evidence(options: &mut [ProfileOption], usage_options: &[ProfileOption]) {
+    for option in options.iter_mut() {
+        let mut matched_compulsory = false;
+        let mut matched_optional = false;
+        let mut matched_ambiguous = false;
+        let mut matched_value_name: Option<String> = None;
+
+        for usage_opt in usage_options {
+            let matches = usage_opt.name == option.name
+                || option
+                    .short
+                    .as_deref()
+                    .is_some_and(|short| short == usage_opt.name);
+            if !matches {
+                continue;
+            }
+            if matched_value_name.is_none() {
+                matched_value_name = usage_opt.value_name.clone();
+            }
+            match usage_opt.required_source {
+                Some(OptionRequirementSource::UsageCompulsory) => matched_compulsory = true,
+                Some(OptionRequirementSource::UsageOptional) => matched_optional = true,
+                Some(OptionRequirementSource::UsageAmbiguous) => matched_ambiguous = true,
+                _ => {}
+            }
+        }
+
+        if option.value_name.is_none() && matched_value_name.is_some() {
+            option.value_name = matched_value_name;
+        }
+
+        let usage_source = if matched_ambiguous || (matched_compulsory && matched_optional) {
+            Some((false, false, OptionRequirementSource::UsageAmbiguous))
+        } else if matched_compulsory {
+            Some((true, true, OptionRequirementSource::UsageCompulsory))
+        } else if matched_optional {
+            Some((false, true, OptionRequirementSource::UsageOptional))
+        } else {
+            None
+        };
+
+        if let Some((usage_req, known, source)) = usage_source {
+            if option.required_source == Some(OptionRequirementSource::OptionMarker)
+                && option.required != usage_req
+            {
+                option.required = false;
+                option.required_known = false;
+                option.required_source = Some(OptionRequirementSource::UsageAmbiguous);
+            } else {
+                option.required = usage_req;
+                option.required_known = known;
+                option.required_source = Some(source);
+            }
+        }
+    }
+}
+
+fn has_unambiguous_required_option_marker(summary: Option<&str>) -> bool {
+    let Some(summary) = summary else {
+        return false;
+    };
+    let trimmed = summary.trim().trim_end_matches('.').trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.contains("not required")
+        || lowered.contains("required if")
+        || lowered.contains("required when")
+        || lowered.contains("required for")
+        || lowered.contains("required unless")
+    {
+        return false;
+    }
+    lowered == "[required]"
+        || lowered == "(required)"
+        || lowered.ends_with(" [required]")
+        || lowered.ends_with(" (required)")
+}
+
+fn parse_usage_options(lines: &[&str], command_name: &str) -> Vec<ProfileOption> {
+    analyze_usage_options(lines, command_name, false)
 }
 
 fn looks_like_usage_continuation(line: &str, command_name: &str) -> bool {
@@ -2881,11 +3539,14 @@ fn parse_option_entry(line: &str) -> Option<ProfileOption> {
             .map(|m| m.as_str().trim_matches(&['<', '>'][..]).to_string())
     });
 
+    let marked_required = has_unambiguous_required_option_marker(summary);
     Some(ProfileOption {
         name,
         short,
         value_name,
-        required: false,
+        required: marked_required,
+        required_known: marked_required,
+        required_source: marked_required.then_some(OptionRequirementSource::OptionMarker),
         summary: summary.map(|value| value.to_string()),
         confidence: if long.is_some() {
             ConfidenceLevel::High
@@ -3423,6 +4084,8 @@ SYNOPSIS
             short: None,
             value_name: None,
             required: false,
+            required_known: false,
+            required_source: None,
             summary: None,
             confidence: ConfidenceLevel::Medium,
         }];
@@ -3433,6 +4096,8 @@ SYNOPSIS
                 short: Some("-v".into()),
                 value_name: None,
                 required: false,
+                required_known: false,
+                required_source: None,
                 summary: Some("Make some output more verbose.".into()),
                 confidence: ConfidenceLevel::High,
             }],
@@ -3550,5 +4215,381 @@ language. For details, use `man bc`.
         assert!(!super::should_enable_batch_progress(3, false));
         assert!(super::should_enable_batch_progress(10, false));
         assert!(super::should_enable_batch_progress(1, true));
+    }
+
+    #[test]
+    fn parse_usage_detects_optional_and_compulsory_flags_and_operands() {
+        let optional_help = "Usage: opsctl [--repo <NAME>]\n";
+        let optional_profile = super::parse_help_text("opsctl", "opsctl", "opsctl", optional_help);
+        let opt = optional_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--repo")
+            .unwrap();
+        assert!(!opt.required);
+        assert_eq!(opt.value_name.as_deref(), Some("NAME"));
+        assert_eq!(
+            opt.required_source,
+            Some(super::OptionRequirementSource::UsageOptional)
+        );
+
+        let compulsory_help = "Usage: opsctl --repo <NAME>\n";
+        let compulsory_profile =
+            super::parse_help_text("opsctl", "opsctl", "opsctl", compulsory_help);
+        let comp = compulsory_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--repo")
+            .unwrap();
+        assert!(comp.required);
+        assert_eq!(comp.value_name.as_deref(), Some("NAME"));
+        assert_eq!(
+            comp.required_source,
+            Some(super::OptionRequirementSource::UsageCompulsory)
+        );
+
+        let short_help = r#"Usage: opsctl -r <NAME> [OPTIONS]
+
+Options:
+  -r, --repo <NAME>  Target repository
+  --json             JSON output
+"#;
+        let short_profile = super::parse_help_text("opsctl", "opsctl", "opsctl", short_help);
+        let repo = short_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--repo")
+            .unwrap();
+        assert!(repo.required);
+        assert_eq!(
+            repo.required_source,
+            Some(super::OptionRequirementSource::UsageCompulsory)
+        );
+        let json_opt = short_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--json")
+            .unwrap();
+        assert!(!json_opt.required);
+
+        let optional_operand_help = "Usage: opsctl --repo [<NAME>] [--tag[=<TAG>]]\n";
+        let oo_profile =
+            super::parse_help_text("opsctl", "opsctl", "opsctl", optional_operand_help);
+        let oo_repo = oo_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--repo")
+            .unwrap();
+        assert!(oo_repo.required);
+        assert_eq!(oo_repo.value_name.as_deref(), Some("NAME"));
+        let oo_tag = oo_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--tag")
+            .unwrap();
+        assert!(!oo_tag.required);
+        assert_eq!(oo_tag.value_name.as_deref(), Some("TAG"));
+    }
+
+    #[test]
+    fn parse_usage_respects_ambiguity_and_multi_invocation_lines() {
+        let alt_help = "Usage: opsctl (--repo <NAME> | --org <ORG>) --env <ENV> [--quiet]\n";
+        let alt_profile = super::parse_help_text("opsctl", "opsctl", "opsctl", alt_help);
+        let repo = alt_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--repo")
+            .unwrap();
+        let org = alt_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--org")
+            .unwrap();
+        let env_opt = alt_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--env")
+            .unwrap();
+        assert!(!repo.required);
+        assert_eq!(
+            repo.required_source,
+            Some(super::OptionRequirementSource::UsageAmbiguous)
+        );
+        assert!(!org.required);
+        assert_eq!(
+            org.required_source,
+            Some(super::OptionRequirementSource::UsageAmbiguous)
+        );
+        assert!(env_opt.required);
+
+        let multi_consistent = "Usage:\n  opsctl --repo <NAME> init\n  opsctl --repo <NAME> sync\n";
+        let consistent_profile =
+            super::parse_help_text("opsctl", "opsctl", "opsctl", multi_consistent);
+        assert!(
+            consistent_profile
+                .options
+                .iter()
+                .find(|o| o.name == "--repo")
+                .unwrap()
+                .required
+        );
+
+        let multi_partial = "Usage:\n  opsctl --repo <NAME>\n  opsctl --org <ORG>\n";
+        let partial_profile = super::parse_help_text("opsctl", "opsctl", "opsctl", multi_partial);
+        let p_repo = partial_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--repo")
+            .unwrap();
+        assert!(!p_repo.required);
+        assert_eq!(
+            p_repo.required_source,
+            Some(super::OptionRequirementSource::UsageAmbiguous)
+        );
+
+        let unbalanced = "Usage: opsctl [--repo <NAME>\n";
+        let unbalanced_profile = super::parse_help_text("opsctl", "opsctl", "opsctl", unbalanced);
+        let u_repo = unbalanced_profile
+            .options
+            .iter()
+            .find(|o| o.name == "--repo")
+            .unwrap();
+        assert!(!u_repo.required);
+        assert_eq!(
+            u_repo.required_source,
+            Some(super::OptionRequirementSource::UsageAmbiguous)
+        );
+    }
+
+    #[test]
+    fn diff_profile_value_scopes_options_by_nested_command_path() {
+        let mut before = super::parse_help_text(
+            "opsctl",
+            "opsctl",
+            "opsctl",
+            "Usage: opsctl [--repo <NAME>] --token <TOKEN>\n",
+        );
+        let mut before_repo = super::parse_help_text(
+            "repo",
+            "opsctl repo",
+            "opsctl repo",
+            "Usage: opsctl repo [--repo <NAME>]\n",
+        );
+        let before_team_repo = super::parse_help_text(
+            "repo",
+            "opsctl team repo",
+            "opsctl team repo",
+            "Usage: opsctl team repo [--repo <NAME>]\n",
+        );
+        let mut before_team =
+            super::parse_help_text("team", "opsctl team", "opsctl team", "Usage: opsctl team\n");
+        before_team.subcommand_profiles.push(before_team_repo);
+        before_repo.provenance.generation_depth = 1;
+        before.subcommand_profiles.push(before_repo);
+        before.subcommand_profiles.push(before_team);
+
+        let mut after = super::parse_help_text(
+            "opsctl",
+            "opsctl",
+            "opsctl",
+            "Usage: opsctl --repo <NAME> [--token <TOKEN>]\n",
+        );
+        let mut after_repo = super::parse_help_text(
+            "repo",
+            "opsctl repo",
+            "opsctl repo",
+            "Usage: opsctl repo [--repo <NAME>]\n",
+        );
+        let after_team_repo = super::parse_help_text(
+            "repo",
+            "opsctl team repo",
+            "opsctl team repo",
+            "Usage: opsctl team repo --repo <NAME> [--dry-run]\n",
+        );
+        let mut after_team =
+            super::parse_help_text("team", "opsctl team", "opsctl team", "Usage: opsctl team\n");
+        after_team.subcommand_profiles.push(after_team_repo);
+        after_repo.provenance.generation_depth = 1;
+        after.subcommand_profiles.push(after_repo);
+        after.subcommand_profiles.push(after_team);
+
+        let diff = super::diff_profile_value(&before, &after);
+        assert_eq!(
+            diff["options_became_required"],
+            serde_json::json!(["--repo", "team repo --repo"])
+        );
+        assert_eq!(
+            diff["options_became_optional"],
+            serde_json::json!(["--token"])
+        );
+        assert_eq!(
+            diff["nested_options_added"],
+            serde_json::json!(["team repo --dry-run"])
+        );
+
+        // Changing inspection coverage (e.g. before has depth 0, after has depth 2)
+        // must not treat flags of an uninspected child as added or removed.
+        let mut shallow_before = before.clone();
+        shallow_before.subcommand_profiles.clear();
+        let coverage_up_diff = super::diff_profile_value(&shallow_before, &after);
+        assert_eq!(
+            coverage_up_diff["nested_options_added"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            coverage_up_diff["nested_options_removed"],
+            serde_json::json!([])
+        );
+
+        let mut shallow_after = after.clone();
+        shallow_after.subcommand_profiles.clear();
+        let coverage_down_diff = super::diff_profile_value(&before, &shallow_after);
+        assert_eq!(
+            coverage_down_diff["nested_options_added"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            coverage_down_diff["nested_options_removed"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn diff_requires_known_required_evidence_on_both_sides_and_preserves_absence() {
+        let legacy_json = serde_json::json!({
+            "profile_schema": "sxmc_cli_surface_profile_v1",
+            "command": "opsctl",
+            "summary": "Ops tool",
+            "source": { "kind": "cli", "identifier": "opsctl" },
+            "subcommands": [],
+            "options": [
+                { "name": "--explicit-false", "required": false },
+                { "name": "--explicit-true", "required": true },
+                { "name": "--omitted" }
+            ],
+            "positionals": [],
+            "examples": [],
+            "auth": [],
+            "environment": [],
+            "output_behavior": { "stdout_style": "plain_text", "stderr_usage": "", "machine_friendly": false },
+            "workflows": [],
+            "confidence_notes": [],
+            "provenance": {
+                "generated_by": "sxmc",
+                "generator_version": "0.9.0",
+                "source_kind": "cli",
+                "source_identifier": "opsctl",
+                "profile_schema": "sxmc_cli_surface_profile_v1",
+                "generation_depth": 0
+            }
+        });
+        let legacy: super::CliSurfaceProfile = serde_json::from_value(legacy_json).unwrap();
+        let roundtripped = serde_json::to_value(&legacy).unwrap();
+        let rt_opts = roundtripped["options"].as_array().unwrap();
+        assert_eq!(rt_opts[0].get("required"), Some(&serde_json::json!(false)));
+        assert_eq!(rt_opts[1].get("required"), Some(&serde_json::json!(true)));
+        assert_eq!(rt_opts[2].get("required"), None);
+
+        let unknown_help = "Usage: opsctl (--ambig <A> | --alt <B>) [OPTIONS]\n\nOptions:\n  --ambig <A>   Ambiguous\n  --alt <B>     Alternative\n  --no-ev       No usage evidence\n";
+        let unknown_parsed = super::parse_help_text("opsctl", "opsctl", "opsctl", unknown_help);
+        let unknown_json = serde_json::to_value(&unknown_parsed).unwrap();
+        for opt in unknown_json["options"].as_array().unwrap() {
+            assert_eq!(
+                opt.get("required"),
+                None,
+                "unknown flag {} must not serialize required:false",
+                opt["name"]
+            );
+        }
+        let unknown_reloaded: super::CliSurfaceProfile =
+            serde_json::from_value(unknown_json).unwrap();
+
+        let known_before = super::parse_help_text(
+            "opsctl",
+            "opsctl",
+            "opsctl",
+            "Usage: opsctl --ambig <A> --no-ev\n",
+        );
+        let known_to_ambig = super::diff_profile_value(&known_before, &unknown_reloaded);
+        assert_eq!(
+            known_to_ambig["options_became_optional"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            known_to_ambig["options_became_required"],
+            serde_json::json!([])
+        );
+
+        let known_after = super::parse_help_text(
+            "opsctl",
+            "opsctl",
+            "opsctl",
+            "Usage: opsctl --explicit-false --explicit-true --omitted\n",
+        );
+        let legacy_diff = super::diff_profile_value(&legacy, &known_after);
+        assert_eq!(
+            legacy_diff["options_became_required"],
+            serde_json::json!(["--explicit-false"])
+        );
+        assert_eq!(
+            legacy_diff["options_became_optional"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn parse_man_page_equal_count_options_still_applies_synopsis_evidence() {
+        let man_text = r#"NAME
+       foo - manage foo targets
+
+SYNOPSIS
+       foo --repo <NAME> [--json]
+
+DESCRIPTION
+       Manage foo targets.
+
+OPTIONS
+       --repo <NAME>
+              Target repository.
+
+       --json
+              Emit JSON.
+"#;
+        let profile = super::parse_help_text("foo", "foo", "foo", man_text);
+        let repo = profile.options.iter().find(|o| o.name == "--repo").unwrap();
+        let json_opt = profile.options.iter().find(|o| o.name == "--json").unwrap();
+        assert!(repo.required);
+        assert_eq!(
+            repo.required_source,
+            Some(super::OptionRequirementSource::UsageCompulsory)
+        );
+        assert!(!json_opt.required);
+        assert_eq!(
+            json_opt.required_source,
+            Some(super::OptionRequirementSource::UsageOptional)
+        );
+
+        let ambig_man = r#"NAME
+       foo - manage foo targets
+
+SYNOPSIS
+       foo (--repo <NAME> | --org <ORG>)
+
+DESCRIPTION
+       Manage foo targets.
+
+OPTIONS
+       --repo <NAME>
+              Target repository.
+
+       --org <ORG>
+              Target organization.
+"#;
+        let ambig_profile = super::parse_help_text("foo", "foo", "foo", ambig_man);
+        let serialized = serde_json::to_value(&ambig_profile).unwrap();
+        for opt in serialized["options"].as_array().unwrap() {
+            assert_eq!(opt.get("required"), None);
+            assert_eq!(opt["required_source"], serde_json::json!("usage_ambiguous"));
+        }
     }
 }

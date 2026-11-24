@@ -22,67 +22,40 @@ fn has_command(name: &str) -> bool {
         .is_ok()
 }
 
+#[cfg(unix)]
 fn find_command_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let dirs = std::env::split_paths(&path);
-
-    #[cfg(windows)]
-    let exts: Vec<String> = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-        .split(';')
-        .filter(|ext| !ext.is_empty())
-        .map(|ext| ext.to_ascii_lowercase())
-        .collect();
-
-    #[cfg(not(windows))]
-    let exts = vec![String::new()];
-
-    for dir in dirs {
-        for ext in &exts {
-            let candidate = if ext.is_empty() || name.to_ascii_lowercase().ends_with(ext) {
-                dir.join(name)
-            } else {
-                dir.join(format!("{name}{ext}"))
-            };
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
-#[cfg(unix)]
-fn create_command_wrapper(bin_dir: &Path, name: &str, target: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let script = bin_dir.join(name);
-    let body = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", target.display());
-    fs::write(&script, body).unwrap();
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
-    script
-}
-
-#[cfg(windows)]
-fn create_command_wrapper(bin_dir: &Path, name: &str, target: &Path) -> PathBuf {
-    let script = bin_dir.join(format!("{name}.cmd"));
-    let body = format!("@echo off\r\n\"{}\" %*\r\n", target.display());
-    fs::write(&script, body).unwrap();
-    script
-}
-
-fn isolated_path_with_tools(root: &Path, names: &[&str]) -> String {
+fn onboarding_fixture_path(root: &Path, names: &[&str]) -> PathBuf {
     let bin_dir = root.join("isolated-bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-    for name in names {
-        let target = find_command_on_path(name)
-            .unwrap_or_else(|| panic!("expected {name} to exist on PATH for integration test"));
-        create_command_wrapper(&bin_dir, name, &target);
+    fs::create_dir(&bin_dir).unwrap();
+    let executable = |name| bin_dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let (first, rest) = names.split_first().expect("at least one onboarding tool");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/onboarding_cli.rs");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    Command::new(rustc)
+        .timeout(Duration::from_secs(60))
+        .arg(fixture)
+        .arg("-o")
+        .arg(executable(first))
+        .assert()
+        .success();
+    for name in rest {
+        fs::hard_link(executable(first), executable(name)).unwrap();
     }
-    bin_dir.to_string_lossy().into_owned()
+    bin_dir
+}
+
+fn sxmc_with_onboarding_tools(home: &Path, bin_dir: &Path) -> Command {
+    let mut command = sxmc_with_config_home(home);
+    command
+        .env("PATH", bin_dir)
+        .timeout(Duration::from_secs(30));
+    command
 }
 
 fn sxmc_with_config_home(home: &Path) -> Command {
@@ -92,6 +65,7 @@ fn sxmc_with_config_home(home: &Path) -> Command {
     cmd.env("XDG_CONFIG_HOME", home.join(".config"));
     cmd.env("APPDATA", home.join("AppData").join("Roaming"));
     cmd.env("LOCALAPPDATA", home.join("AppData").join("Local"));
+    cmd.env_remove("CODEX_HOME");
     cmd
 }
 
@@ -4393,16 +4367,20 @@ fn test_init_ai_blocks_low_confidence_profiles_without_override() {
 #[test]
 fn test_add_applies_to_detected_hosts_and_saves_profile() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
     fs::write(
         temp.path().join("CLAUDE.md"),
         "# Existing Claude guidance\n",
     )
     .unwrap();
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
-        .args(["add", "git", "--root", temp.path().to_str().unwrap()])
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
+        .args([
+            "add",
+            "fixture-notes",
+            "--root",
+            temp.path().to_str().unwrap(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Detected AI hosts: Claude Code"))
@@ -4414,8 +4392,13 @@ fn test_add_applies_to_detected_hosts_and_saves_profile() {
         .join(".sxmc")
         .join("ai")
         .join("profiles")
-        .join("git.json");
-    assert!(profile_path.exists(), "expected git profile to be written");
+        .join("fixture-notes.json");
+    let profile: Value = serde_json::from_slice(&fs::read(&profile_path).unwrap()).unwrap();
+    assert_eq!(profile["command"], "fixture-notes");
+    assert_eq!(
+        profile["examples"][0]["command"],
+        "fixture-notes list --json"
+    );
     assert!(
         temp.path()
             .join(".sxmc")
@@ -4427,17 +4410,21 @@ fn test_add_applies_to_detected_hosts_and_saves_profile() {
 
     let claude = fs::read_to_string(temp.path().join("CLAUDE.md")).unwrap();
     assert!(claude.contains("sxmc:begin cli-ai:claude-code"));
-    assert!(claude.contains("git"));
+    assert!(claude.contains("fixture-notes"));
 }
 
 #[test]
 fn test_add_without_detected_hosts_previews_full_plan() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
-        .args(["add", "git", "--root", temp.path().to_str().unwrap()])
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
+        .args([
+            "add",
+            "fixture-notes",
+            "--root",
+            temp.path().to_str().unwrap(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("No AI hosts detected"))
@@ -4451,7 +4438,7 @@ fn test_add_without_detected_hosts_previews_full_plan() {
         .join(".sxmc")
         .join("ai")
         .join("profiles")
-        .join("git.json");
+        .join("fixture-notes.json");
     assert!(
         !profile_path.exists(),
         "preview path should not write the profile yet"
@@ -4461,47 +4448,48 @@ fn test_add_without_detected_hosts_previews_full_plan() {
 #[test]
 fn test_add_supports_structured_output_and_client_alias() {
     let temp = tempfile::tempdir().unwrap();
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
     fs::write(
         temp.path().join("CLAUDE.md"),
         "# Existing Claude guidance\n",
     )
     .unwrap();
 
-    let value = command_json_with_config_home(
-        temp.path(),
-        &[
+    let result = sxmc_with_onboarding_tools(temp.path(), &isolated_path)
+        .args([
             "add",
-            "git",
+            "fixture-notes",
             "--client",
             "claude-code",
             "--root",
             temp.path().to_str().unwrap(),
             "--format",
             "json-pretty",
-        ],
-    );
+        ])
+        .assert()
+        .success();
+    let value: Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
 
     assert_eq!(value["command"], Value::from("add"));
-    assert_eq!(value["tool"], Value::from("git"));
+    assert_eq!(value["tool"], Value::from("fixture-notes"));
     assert_eq!(value["effective_mode"], Value::from("apply"));
     assert_eq!(value["auto_detected_hosts"], Value::from(false));
     assert_eq!(value["hosts"][0]["id"], Value::from("claude-code"));
-    assert_eq!(value["profile"]["command"], Value::from("git"));
+    assert_eq!(value["profile"]["command"], Value::from("fixture-notes"));
     assert!(value["outcome_summary"]["total"].as_u64().unwrap_or(0) > 0);
 }
 
 #[test]
 fn test_add_global_writes_user_level_host_artifacts_and_global_state() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
     let claude_dir = temp.path().join(".claude");
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(claude_dir.join("CLAUDE.md"), "# Existing Claude guidance\n").unwrap();
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
         .current_dir(temp.path())
-        .args(["add", "git", "--global"])
+        .args(["add", "fixture-notes", "--global"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Detected AI hosts: Claude Code"));
@@ -4512,7 +4500,7 @@ fn test_add_global_writes_user_level_host_artifacts_and_global_state() {
         .join("sxmc")
         .join("ai")
         .join("profiles")
-        .join("git.json")
+        .join("fixture-notes.json")
         .exists());
     assert!(temp
         .path()
@@ -4525,7 +4513,7 @@ fn test_add_global_writes_user_level_host_artifacts_and_global_state() {
 
     let claude = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
     assert!(claude.contains("sxmc:begin cli-ai:claude-code"));
-    assert!(claude.contains("git"));
+    assert!(claude.contains("fixture-notes"));
 }
 
 #[test]
@@ -4546,54 +4534,62 @@ fn test_status_global_reports_user_level_targets() {
         .unwrap();
 
     assert_eq!(value["install_scope"], Value::from("global"));
-    assert!(value["startup_files"]["claude_code"]["path"]
+    let reported_path = value["startup_files"]["claude_code"]["path"]
         .as_str()
-        .unwrap_or("")
-        .contains(".claude/CLAUDE.md"));
+        .unwrap();
+    assert_eq!(Path::new(reported_path), claude_dir.join("CLAUDE.md"));
 }
 
 #[test]
 fn test_setup_applies_multiple_tools_to_detected_hosts() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git", "ls"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes", "fixture-sparse"]);
     fs::write(
         temp.path().join("CLAUDE.md"),
         "# Existing Claude guidance\n",
     )
     .unwrap();
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
         .args([
             "setup",
             "--tool",
-            "git,ls",
+            "fixture-notes,fixture-sparse",
             "--allow-low-confidence",
             "--root",
             temp.path().to_str().unwrap(),
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Selected tools: git, ls"))
+        .stdout(predicate::str::contains(
+            "Selected tools: fixture-notes, fixture-sparse",
+        ))
         .stdout(predicate::str::contains("Detected AI hosts: Claude Code"))
-        .stdout(predicate::str::contains("Onboarding tool: git"))
-        .stdout(predicate::str::contains("Onboarding tool: ls"));
+        .stdout(predicate::str::contains("Onboarding tool: fixture-notes"))
+        .stdout(predicate::str::contains("Onboarding tool: fixture-sparse"));
 
-    assert!(temp.path().join(".sxmc/ai/profiles/git.json").exists());
-    assert!(temp.path().join(".sxmc/ai/profiles/ls.json").exists());
+    assert!(temp
+        .path()
+        .join(".sxmc/ai/profiles/fixture-notes.json")
+        .exists());
+    assert!(temp
+        .path()
+        .join(".sxmc/ai/profiles/fixture-sparse.json")
+        .exists());
     assert!(temp.path().join(".sxmc/ai/claude-code-mcp.json").exists());
 }
 
 #[test]
 fn test_setup_global_writes_multiple_profiles_into_global_state() {
     let temp = tempfile::tempdir().unwrap();
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes", "fixture-tasks"]);
     let claude_dir = temp.path().join(".claude");
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(claude_dir.join("CLAUDE.md"), "# Existing Claude guidance\n").unwrap();
 
-    sxmc_with_config_home(temp.path())
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
         .current_dir(temp.path())
-        .args(["setup", "--tool", "git,ls", "--global"])
+        .args(["setup", "--tool", "fixture-notes,fixture-tasks", "--global"])
         .assert()
         .success();
 
@@ -4601,12 +4597,12 @@ fn test_setup_global_writes_multiple_profiles_into_global_state() {
     assert!(config_root
         .join("ai")
         .join("profiles")
-        .join("git.json")
+        .join("fixture-notes.json")
         .exists());
     assert!(config_root
         .join("ai")
         .join("profiles")
-        .join("ls.json")
+        .join("fixture-tasks.json")
         .exists());
     assert!(config_root.join("ai").join("claude-code-mcp.json").exists());
 }
@@ -4614,26 +4610,28 @@ fn test_setup_global_writes_multiple_profiles_into_global_state() {
 #[test]
 fn test_setup_supports_structured_output_and_client_alias() {
     let temp = tempfile::tempdir().unwrap();
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes", "fixture-tasks"]);
     fs::write(
         temp.path().join("CLAUDE.md"),
         "# Existing Claude guidance\n",
     )
     .unwrap();
 
-    let value = command_json_with_config_home(
-        temp.path(),
-        &[
+    let result = sxmc_with_onboarding_tools(temp.path(), &isolated_path)
+        .args([
             "setup",
             "--tool",
-            "git,ls",
+            "fixture-notes,fixture-tasks",
             "--client",
             "claude-code",
             "--root",
             temp.path().to_str().unwrap(),
             "--format",
             "json-pretty",
-        ],
-    );
+        ])
+        .assert()
+        .success();
+    let value: Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
 
     assert_eq!(value["command"], Value::from("setup"));
     assert_eq!(value["effective_mode"], Value::from("apply"));
@@ -4643,32 +4641,37 @@ fn test_setup_supports_structured_output_and_client_alias() {
     assert_eq!(value["results"].as_array().unwrap().len(), 2);
     assert_eq!(
         value["results"][0]["profile"]["command"],
-        Value::from("git")
+        Value::from("fixture-notes")
     );
-    assert_eq!(value["results"][1]["profile"]["command"], Value::from("ls"));
+    assert_eq!(
+        value["results"][1]["profile"]["command"],
+        Value::from("fixture-tasks")
+    );
 }
 
 #[test]
 fn test_setup_previews_when_no_hosts_are_configured() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
         .args([
             "setup",
             "--tool",
-            "git",
+            "fixture-notes",
             "--root",
             temp.path().to_str().unwrap(),
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Selected tools: git"))
+        .stdout(predicate::str::contains("Selected tools: fixture-notes"))
         .stdout(predicate::str::contains("No AI hosts detected"))
         .stdout(predicate::str::contains("Would create CLI profile:"));
 
-    assert!(!temp.path().join(".sxmc/ai/profiles/git.json").exists());
+    assert!(!temp
+        .path()
+        .join(".sxmc/ai/profiles/fixture-notes.json")
+        .exists());
 }
 
 #[test]
@@ -5603,7 +5606,7 @@ fn test_init_ai_full_preview_lists_multi_host_targets() {
         .stdout(predicate::str::contains(".windsurf/rules/sxmc-cli-ai.md"))
         .stdout(predicate::str::contains(".cursor/mcp.json"))
         .stdout(predicate::str::contains(".gemini/settings.json"))
-        .stdout(predicate::str::contains(".codex/mcp.toml"));
+        .stdout(predicate::str::contains(".codex/config.toml"));
 }
 
 #[test]
@@ -5687,6 +5690,10 @@ fn test_init_ai_full_apply_updates_selected_hosts_and_sidecars_rest() {
         .join(".sxmc/ai/gemini-cli/GEMINI.md.sxmc.snippet")
         .exists());
     assert!(temp
+        .path()
+        .join(".sxmc/ai/openai-codex/config.toml.sxmc.snippet")
+        .exists());
+    assert!(!temp
         .path()
         .join(".sxmc/ai/openai-codex/mcp.toml.sxmc.snippet")
         .exists());
@@ -9352,4 +9359,1322 @@ Hello version two, $ARGUMENTS!
         saw_reload,
         "watch mode did not reload the updated skill body"
     );
+}
+
+#[test]
+fn test_codex_scaffold_client_config_preserves_existing_toml_comments_and_is_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex_dir = temp.path().join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+    let existing = concat!(
+        "# User top-level comment\n",
+        "model = \"gpt-6.2-sol\" # keep inline comment\n",
+        "model_auto_compact_token_limit = 272000\n",
+        "\n",
+        "[features]\n",
+        "shell_snapshot = true\n",
+        "\n",
+        "[projects.\"/tmp/example\"]\n",
+        "trust_level = \"trusted\"\n",
+        "\n",
+        "[mcp_servers.user_existing]\n",
+        "command = \"npx\"\n",
+        "args = [\"-y\", \"some-mcp\"]\n",
+        "\n",
+        "# sxmc:begin cli-ai:openai-codex\n",
+        "# sxmc CLI->AI startup scaffold\n",
+        "[mcp_servers.sxmc-cli-ai-other]\n",
+        "command = \"sxmc\"\n",
+        "args = [\"serve\", \"--paths\", \"/tmp/other-skills\"]\n",
+        "# sxmc:end cli-ai:openai-codex\n",
+        "\n",
+        "# Trailing user settings must remain intact\n",
+        "[profiles.fast]\n",
+        "model_reasoning_effort = \"medium\"\n",
+        "\n",
+        "[mcp_servers.user_after]\n",
+        "command = \"uvx\"\n",
+        "args = [\"tool-after\"]\n",
+    );
+    fs::write(&config_path, existing).unwrap();
+
+    sxmc_with_config_home(temp.path())
+        .args([
+            "scaffold",
+            "client-config",
+            "--from-profile",
+            "examples/profiles/from_cli.json",
+            "--client",
+            "openai-codex",
+            "--root",
+            temp.path().to_str().unwrap(),
+            "--mode",
+            "apply",
+        ])
+        .assert()
+        .success();
+
+    assert!(!codex_dir.join("mcp.toml").exists());
+    let after_first = fs::read_to_string(&config_path).unwrap();
+    assert!(after_first.contains("# User top-level comment"));
+    assert!(after_first.contains("model = \"gpt-6.2-sol\" # keep inline comment"));
+    assert!(after_first.contains("model_auto_compact_token_limit = 272000"));
+    assert!(after_first.contains("[features]\nshell_snapshot = true"));
+    assert!(after_first.contains("[projects.\"/tmp/example\"]"));
+    assert!(after_first.contains("[mcp_servers.user_existing]"));
+    assert!(after_first.contains("# Trailing user settings must remain intact"));
+    assert!(after_first.contains("[profiles.fast]\nmodel_reasoning_effort = \"medium\""));
+    assert!(after_first.contains("[mcp_servers.user_after]"));
+    assert!(after_first.contains("# sxmc:begin cli-ai:openai-codex"));
+    assert!(after_first.contains("[mcp_servers.sxmc-cli-ai-other]"));
+    assert!(after_first.contains("[mcp_servers.sxmc-cli-ai-gh]"));
+    assert!(after_first.contains("# sxmc:end cli-ai:openai-codex"));
+
+    let parsed: toml::Table =
+        toml::from_str(&after_first).expect("merged config must be valid TOML");
+    assert_eq!(parsed["model"].as_str(), Some("gpt-6.2-sol"));
+    assert_eq!(parsed["features"]["shell_snapshot"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["profiles"]["fast"]["model_reasoning_effort"].as_str(),
+        Some("medium")
+    );
+    assert!(parsed["mcp_servers"]["user_existing"].is_table());
+    assert!(parsed["mcp_servers"]["user_after"].is_table());
+    assert!(parsed["mcp_servers"]["sxmc-cli-ai-other"].is_table());
+    assert!(parsed["mcp_servers"]["sxmc-cli-ai-gh"].is_table());
+
+    // Idempotent second apply
+    sxmc_with_config_home(temp.path())
+        .args([
+            "scaffold",
+            "client-config",
+            "--from-profile",
+            "examples/profiles/from_cli.json",
+            "--client",
+            "openai-codex",
+            "--root",
+            temp.path().to_str().unwrap(),
+            "--mode",
+            "apply",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped unchanged"));
+
+    let after_second = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(after_first, after_second);
+}
+
+#[test]
+fn test_codex_apply_preserves_user_toml_scope_and_nested_tables() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join(".codex/config.toml");
+    fs::create_dir(config.parent().unwrap()).unwrap();
+    let existing = concat!(
+        "model = 'local-fixture'\n",
+        "# sxmc:begin cli-ai:openai-codex\n",
+        "[mcp_servers.a]\ncommand = 'old'\n",
+        "[mcp_servers.a.env]\nMANAGED = 'retained'\n",
+        "# sxmc:end cli-ai:openai-codex\n",
+        "USER = 'still belongs to a.env'\n",
+        "[mcp_servers.user.env]\nOTHER = 'outside'\n",
+    );
+    fs::write(&config, existing).unwrap();
+    let apply = || {
+        codex_fixture_command(temp.path())
+            .timeout(Duration::from_secs(10))
+            .args([
+                "scaffold",
+                "client-config",
+                "--from-profile",
+                "examples/profiles/from_cli.json",
+                "--client",
+                "openai-codex",
+                "--root",
+                temp.path().to_str().unwrap(),
+                "--mode",
+                "apply",
+            ])
+            .assert()
+            .success();
+    };
+    apply();
+    let updated = fs::read_to_string(&config).unwrap();
+    let mut parsed: toml::Table = toml::from_str(&updated).unwrap();
+    let added = parsed["mcp_servers"]
+        .as_table_mut()
+        .unwrap()
+        .remove("sxmc-cli-ai-gh")
+        .unwrap();
+    assert_eq!(added["command"].as_str(), Some("sxmc"));
+    assert_eq!(parsed, toml::from_str::<toml::Table>(existing).unwrap());
+    apply();
+    assert_eq!(fs::read_to_string(&config).unwrap(), updated);
+}
+
+#[test]
+fn test_codex_refresh_and_remove_preserve_another_servers_trailing_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let config = root.join(".codex/config.toml");
+    fs::create_dir(config.parent().unwrap()).unwrap();
+    fs::write(&config, "model = 'fixture'\n").unwrap();
+
+    let mut profile: Value =
+        serde_json::from_str(include_str!("../examples/profiles/from_cli.json")).unwrap();
+    let register = |source: &Path, skills: &str| {
+        codex_fixture_command(root)
+            .timeout(Duration::from_secs(15))
+            .args(["scaffold", "client-config", "--from-profile"])
+            .arg(source)
+            .args(["--client", "openai-codex", "--root"])
+            .arg(root)
+            .args(["--mode", "apply", "--skills-path", skills])
+            .assert()
+            .success();
+    };
+    let read_config =
+        || toml::from_str::<toml::Table>(&fs::read_to_string(&config).unwrap()).unwrap();
+    let registration = |skills: &str| {
+        toml::Value::try_from(json!({
+            "command": "sxmc",
+            "args": ["serve", "--paths", root.join(skills)]
+        }))
+        .unwrap()
+    };
+    register(Path::new("examples/profiles/from_cli.json"), "gh-skills");
+    let suffix = "enabled = false\n\n[mcp_servers.user.env]\nUSER_VAR = 'keep'\n";
+    let initial = fs::read_to_string(&config).unwrap();
+    fs::write(&config, format!("{initial}{suffix}")).unwrap();
+    let mut expected: toml::Table = toml::from_str(concat!(
+        "model = 'fixture'\n",
+        "[mcp_servers.user.env]\nUSER_VAR = 'keep'\n",
+    ))
+    .unwrap();
+    let mut gh = registration("gh-skills");
+    gh.as_table_mut()
+        .unwrap()
+        .insert("enabled".into(), false.into());
+    expected["mcp_servers"]
+        .as_table_mut()
+        .unwrap()
+        .insert("sxmc-cli-ai-gh".into(), gh);
+    assert_eq!(read_config(), expected);
+
+    let git_profile = root.join("git-profile.json");
+    let spare_profile = root.join("spare-profile.json");
+    for (name, path, skills) in [
+        ("git", &git_profile, "git-skills"),
+        ("spare", &spare_profile, "spare-skills"),
+    ] {
+        profile["command"] = Value::from(name);
+        fs::write(path, serde_json::to_vec(&profile).unwrap()).unwrap();
+        register(path, skills);
+        expected["mcp_servers"]
+            .as_table_mut()
+            .unwrap()
+            .insert(format!("sxmc-cli-ai-{name}"), registration(skills));
+        assert_eq!(read_config(), expected);
+    }
+    register(&git_profile, "refreshed-git-skills");
+    expected["mcp_servers"]["sxmc-cli-ai-git"] = registration("refreshed-git-skills");
+    assert_eq!(read_config(), expected);
+    assert!(fs::read_to_string(&config).unwrap().ends_with(suffix));
+
+    codex_fixture_command(root)
+        .timeout(Duration::from_secs(45))
+        .args([
+            "init",
+            "ai",
+            "--from-cli",
+            "git",
+            "--client",
+            "openai-codex",
+            "--root",
+        ])
+        .arg(root)
+        .args(["--mode", "apply", "--remove"])
+        .assert()
+        .success();
+    expected["mcp_servers"]
+        .as_table_mut()
+        .unwrap()
+        .remove("sxmc-cli-ai-git");
+    assert_eq!(read_config(), expected);
+    assert!(fs::read_to_string(&config).unwrap().ends_with(suffix));
+}
+
+#[test]
+fn test_codex_remove_refuses_to_orphan_user_settings_on_a_managed_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join(".codex/config.toml");
+    fs::create_dir(config.parent().unwrap()).unwrap();
+    let existing = concat!(
+        "[features]\nshell_snapshot = true\n",
+        "# sxmc:begin cli-ai:openai-codex\n",
+        "[mcp_servers.sxmc-cli-ai-git]\ncommand = 'sxmc'\nargs = ['serve']\n",
+        "# sxmc:end cli-ai:openai-codex\nenabled = false\n",
+        "[mcp_servers.sxmc-cli-ai-git.env]\nUSER = 'preserve'\n",
+    );
+    fs::write(&config, existing).unwrap();
+    codex_fixture_command(temp.path())
+        .timeout(Duration::from_secs(45))
+        .args([
+            "init",
+            "ai",
+            "--from-cli",
+            "git",
+            "--client",
+            "openai-codex",
+            "--root",
+            temp.path().to_str().unwrap(),
+            "--mode",
+            "apply",
+            "--remove",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("user settings"));
+    assert_eq!(fs::read_to_string(&config).unwrap(), existing);
+}
+
+#[test]
+fn test_codex_sync_retries_after_resolving_an_unmanaged_collision() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let root_arg = root.to_str().unwrap();
+    let profiles = root.join(".sxmc/ai/profiles");
+    fs::create_dir_all(&profiles).unwrap();
+    let saved = profiles.join("git.json");
+    let inspected = codex_fixture_command(root)
+        .timeout(Duration::from_secs(45))
+        .args(["inspect", "cli", "git", "--pretty"])
+        .assert()
+        .success();
+    let mut profile: Value = serde_json::from_slice(&inspected.get_output().stdout).unwrap();
+    profile["summary"] = Value::from("Outdated git summary");
+    let original_profile = serde_json::to_vec_pretty(&profile).unwrap();
+    fs::write(&saved, &original_profile).unwrap();
+    let config = root.join(".codex/config.toml");
+    fs::create_dir(config.parent().unwrap()).unwrap();
+    let collision = "[mcp_servers.sxmc-cli-ai-git]\ncommand = 'user-tool'\n";
+    fs::write(&config, collision).unwrap();
+    let sync = || {
+        let mut command = codex_fixture_command(root);
+        command.timeout(Duration::from_secs(45)).args([
+            "sync",
+            "--root",
+            root_arg,
+            "--only",
+            "openai-codex",
+            "--apply",
+            "--pretty",
+        ]);
+        command.assert()
+    };
+    sync()
+        .failure()
+        .stderr(predicate::str::contains("unmanaged"));
+    assert_eq!(fs::read_to_string(&config).unwrap(), collision);
+    assert!(
+        fs::read(&saved).unwrap() == original_profile,
+        "failed sync replaced the saved profile"
+    );
+    let profile_files: Vec<_> = fs::read_dir(&profiles)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(profile_files, ["git.json"]);
+    assert!(!root.join(".sxmc/state.json").exists());
+    let resolved = "[mcp_servers.user_git]\ncommand = 'user-tool'\n";
+    fs::write(&config, resolved).unwrap();
+    let retry = sync().success();
+    let report: Value = serde_json::from_slice(&retry.get_output().stdout).unwrap();
+    assert_eq!(report["entries"][0]["state"], "applied");
+    let mut parsed: toml::Table = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    let added = parsed["mcp_servers"]
+        .as_table_mut()
+        .unwrap()
+        .remove("sxmc-cli-ai-git")
+        .unwrap();
+    assert_eq!(added["command"].as_str(), Some("sxmc"));
+    assert_eq!(parsed, toml::from_str::<toml::Table>(resolved).unwrap());
+    let refreshed: Value = serde_json::from_slice(&fs::read(saved).unwrap()).unwrap();
+    assert_ne!(refreshed["summary"], profile["summary"]);
+    assert!(root.join(".sxmc/state.json").is_file());
+}
+
+#[test]
+fn test_codex_native_writers_share_lock_across_config_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_str().unwrap();
+    let codex = temp.path().join(".codex");
+    fs::create_dir(&codex).unwrap();
+    let config = codex.join("config.toml");
+    let lock = fs::File::create(codex.join("config.toml.sxmc.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let apply = || {
+        codex_fixture_command(temp.path())
+            .timeout(Duration::from_secs(10))
+            .args([
+                "scaffold",
+                "client-config",
+                "--from-profile",
+                "examples/profiles/from_cli.json",
+                "--client",
+                "openai-codex",
+                "--root",
+                root,
+                "--mode",
+                "apply",
+            ])
+            .assert()
+    };
+    let remove = || {
+        codex_fixture_command(temp.path())
+            .timeout(Duration::from_secs(45))
+            .args([
+                "init",
+                "ai",
+                "--from-cli",
+                "git",
+                "--client",
+                "openai-codex",
+                "--root",
+                root,
+                "--mode",
+                "apply",
+                "--remove",
+            ])
+            .assert()
+    };
+    fs::write(&config, "# before first writer's commit\n").unwrap();
+    apply().failure().stderr(predicate::str::contains(
+        "Timed out waiting for Codex config lock",
+    ));
+
+    let committed = concat!(
+        "model = 'local-fixture'\n",
+        "# sxmc:begin cli-ai:openai-codex\n",
+        "[mcp_servers.sxmc-cli-ai-git]\ncommand = 'sxmc'\nargs = ['serve']\n",
+        "# sxmc:end cli-ai:openai-codex\n",
+    );
+    let mut replacement = tempfile::NamedTempFile::new_in(&codex).unwrap();
+    std::io::Write::write_all(&mut replacement, committed.as_bytes()).unwrap();
+    replacement.persist(&config).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    remove().failure().stderr(predicate::str::contains(
+        "Timed out waiting for Codex config lock",
+    ));
+    assert_eq!(fs::read_to_string(&config).unwrap(), committed);
+    drop(lock);
+
+    apply().success();
+    let updated = fs::read_to_string(&config).unwrap();
+    let mut parsed: toml::Table = toml::from_str(&updated).unwrap();
+    let added = parsed["mcp_servers"]
+        .as_table_mut()
+        .unwrap()
+        .remove("sxmc-cli-ai-gh")
+        .unwrap();
+    assert_eq!(added["command"].as_str(), Some("sxmc"));
+    assert_eq!(parsed, toml::from_str::<toml::Table>(committed).unwrap());
+    remove().success();
+    parsed["mcp_servers"] =
+        toml::Value::Table(toml::Table::from_iter([("sxmc-cli-ai-gh".into(), added)]));
+    assert_eq!(
+        toml::from_str::<toml::Table>(&fs::read_to_string(&config).unwrap()).unwrap(),
+        parsed
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(config).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+}
+
+#[cfg(unix)]
+fn run_codex_smoke_bounded(
+    command: ProcessCommand,
+    timeout: Duration,
+    ready: Option<&Path>,
+) -> std::io::Result<std::process::Output> {
+    use std::io;
+    use tokio::io::AsyncReadExt;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let mut command = tokio::process::Command::from(command);
+            let mut child = command
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let group = format!("-{}", child.id().expect("spawned child group"));
+            let mut stdout_pipe = child.stdout.take().expect("piped smoke stdout");
+            let mut stderr_pipe = child.stderr.take().expect("piped smoke stderr");
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let wait_for_output = async {
+                if let Some(path) = ready {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !path.try_exists()? {
+                            tokio::time::sleep(Duration::from_millis(25)).await; // lessons: allow L4 poll the readiness marker under a deadline
+                        }
+                        Ok::<(), io::Error>(())
+                    })
+                    .await
+                    .map_err(|_| io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "waiting for the Codex smoke fixture to signal readiness",
+                    ))??;
+                }
+                tokio::time::timeout(timeout, async {
+                    tokio::try_join!(
+                        stdout_pipe.read_to_end(&mut stdout),
+                        stderr_pipe.read_to_end(&mut stderr),
+                    )?;
+                    // Keep the group leader's PID reserved until it and its pipe holders are done.
+                    child.wait() // lessons: allow L21 the timeout bounds the wait and both reads
+                        .await
+                })
+                .await
+                .map_err(|_| io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "waiting for Codex smoke exit and output",
+                ))?
+            };
+            let error = match wait_for_output.await {
+                Ok(status) => return Ok(std::process::Output { status, stdout, stderr }),
+                Err(error) => error,
+            };
+
+            // Give the Python supervisor time to stop and reap its separate app-server session.
+            let term = signal_codex_smoke_group("-TERM", &group).await;
+            let graceful = if term.is_ok() {
+                Some(tokio::time::timeout(Duration::from_secs(7), async {
+                    let mut discard_stdout = tokio::io::sink();
+                    let mut discard_stderr = tokio::io::sink();
+                    tokio::try_join!(
+                        tokio::io::copy(&mut stdout_pipe, &mut discard_stdout),
+                        tokio::io::copy(&mut stderr_pipe, &mut discard_stderr),
+                    )?;
+                    child.wait() // lessons: allow L21 the cleanup deadline bounds the wait
+                        .await
+                }).await)
+            } else {
+                None
+            };
+            if matches!(graceful, Some(Ok(Ok(_)))) {
+                return Err(error);
+            }
+
+            let kill = signal_codex_smoke_group("-KILL", &group).await;
+            let reap = tokio::time::timeout(
+                Duration::from_secs(2),
+                child.wait(), // lessons: allow L21 reap is bounded by the enclosing timeout
+            )
+            .await;
+            if kill.is_err() || !matches!(reap, Ok(Ok(_))) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; smoke cleanup: term={term:?}, graceful={graceful:?}, kill={kill:?}, reap={reap:?}"),
+                ));
+            }
+            Err(error)
+        })
+}
+
+#[cfg(unix)]
+async fn signal_codex_smoke_group(signal: &str, group: &str) -> std::io::Result<()> {
+    let status = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::process::Command::new("/bin/kill")
+            .args([signal, "--", group])
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await??;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "could not signal smoke process group with {signal}: {status}",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_codex_smoke_timeout_cleans_up_a_ready_descendant_holding_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let ready = temp.path().join("ready");
+    let lock = temp.path().join("fixture.lock");
+    let mut command = ProcessCommand::new("python3");
+    command
+        .args([
+            "-c",
+            r#"
+import fcntl, os, signal, sys
+
+read_end, write_end = os.pipe()
+signal.alarm(10)
+if os.fork():
+    os.close(write_end)
+    assert os.read(read_end, 1) == b"x"
+    sys.exit(0)
+
+signal.alarm(25)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+os.close(read_end)
+with open(sys.argv[2], "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    os.write(sys.stdout.fileno(), b"holding stdout and stderr\n")
+    os.write(write_end, b"x")
+    with open(sys.argv[1], "w") as ready:
+        ready.write("fixture ready\n")
+    signal.pause()
+"#,
+        ])
+        .arg(&ready)
+        .arg(&lock)
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path());
+    let result = run_codex_smoke_bounded(command, Duration::from_millis(100), Some(&ready));
+    assert_eq!(fs::read_to_string(&ready).unwrap(), "fixture ready\n");
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(error.to_string(), "waiting for Codex smoke exit and output");
+
+    let readiness = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match readiness.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            other => panic!("ready descendant retained its fixture lock: {other:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn codex_smoke_fixture(root: &Path) -> (ProcessCommand, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock = root.join("codex");
+    fs::write(&mock, include_str!("fixtures/fake_codex_app_server.py")).unwrap();
+    fs::set_permissions(&mock, fs::Permissions::from_mode(0o700)).unwrap();
+    let smoke_tmp = root.join("smoke_tmp");
+    fs::create_dir(&smoke_tmp).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(root.to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let mut command = ProcessCommand::new("bash");
+    command
+        .env("PATH", path)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("TMPDIR", &smoke_tmp)
+        .args(["scripts/smoke_codex_app_server.sh", &sxmc_bin_string()]);
+    (command, smoke_tmp)
+}
+
+#[cfg(unix)]
+#[test]
+fn test_codex_smoke_drains_both_pipes_and_preserves_buffered_lines() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (command, smoke_tmp) = codex_smoke_fixture(temp.path());
+    run_codex_smoke_bounded(command, Duration::from_secs(30), None)
+        .expect("run Codex smoke before its deadline")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Codex app-server host smoke checks passed.",
+        ));
+    assert!(fs::read_dir(&smoke_tmp).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_codex_smoke_timeout_reaps_supervisor_and_separate_app_server() {
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let probe = root.join("timeout-probe");
+    fs::create_dir(&probe).unwrap();
+    let python = find_command_on_path("python3").expect("python3 for smoke fixture");
+    let shim = root.join("python3");
+    fs::write(
+        &shim,
+        r#"#!/bin/sh
+if [ "$1" = "-" ]; then
+  exec "$SXMC_TEST_REAL_PYTHON" -c '
+import fcntl, os, sys
+fd = os.open(os.path.join(os.environ["SXMC_TEST_CODEX_TIMEOUT_PROBE"], "supervisor.lock"),
+             os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.set_inheritable(fd, True)
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+' "$@"
+fi
+exec "$SXMC_TEST_REAL_PYTHON" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+    let (mut command, smoke_tmp) = codex_smoke_fixture(root);
+    command
+        .env("SXMC_TEST_REAL_PYTHON", python)
+        .env("SXMC_TEST_CODEX_TIMEOUT_PROBE", &probe);
+
+    let ready = probe.join("ready");
+    let result = run_codex_smoke_bounded(command, Duration::from_millis(100), Some(&ready));
+    assert!(
+        ready.is_file(),
+        "separate app-server never signalled readiness"
+    );
+    let open_lock = |name| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(probe.join(name))
+            .unwrap()
+    };
+    let app_server = open_lock("app-server.lock");
+    let supervisor = open_lock("supervisor.lock");
+    let app_server_status = app_server.try_lock();
+    let supervisor_status = supervisor.try_lock();
+
+    fs::write(probe.join("release"), b"").unwrap();
+    if matches!(app_server_status, Err(fs::TryLockError::WouldBlock)) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match app_server.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                other => panic!("app-server did not release its lock after fallback: {other:?}"),
+            }
+        }
+    }
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(error.to_string(), "waiting for Codex smoke exit and output");
+    assert!(
+        supervisor_status.is_ok(),
+        "Python supervisor retained its lock"
+    );
+    assert!(
+        app_server_status.is_ok(),
+        "separate app-server survived the outer timeout"
+    );
+    let smoke_dir = PathBuf::from(fs::read_to_string(ready).unwrap());
+    assert_eq!(
+        smoke_dir.parent(),
+        Some(smoke_tmp.canonicalize().unwrap().as_path())
+    );
+    assert!(!smoke_dir.exists(), "smoke retained its temporary project");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_codex_apply_refuses_native_config_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("user.toml");
+    let original = "model = 'local-fixture'\n";
+    fs::write(&target, original).unwrap();
+    let config = temp.path().join(".codex/config.toml");
+    fs::create_dir(config.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &config).unwrap();
+    codex_fixture_command(temp.path())
+        .timeout(Duration::from_secs(10))
+        .args([
+            "scaffold",
+            "client-config",
+            "--from-profile",
+            "examples/profiles/from_cli.json",
+            "--client",
+            "openai-codex",
+            "--root",
+            temp.path().to_str().unwrap(),
+            "--mode",
+            "apply",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("regular file"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+    assert_eq!(fs::read_link(config).unwrap(), target);
+}
+
+fn codex_fixture_command(root: &Path) -> Command {
+    let mut command = sxmc_with_config_home(root);
+    command
+        .env("SXMC_CONFIG_HOME", root.join("config"))
+        .env("SXMC_CACHE_HOME", root.join("cache"));
+    command
+}
+
+#[test]
+fn test_codex_add_preview_and_apply_match_and_support_multiple_tools() {
+    if !has_command("git") || !has_command("ls") {
+        eprintln!("skipping: git or ls not installed");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let preview_first = command_json_with_config_home(
+        root,
+        &[
+            "add",
+            "git",
+            "--host",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--preview",
+            "--format",
+            "json-pretty",
+        ],
+    );
+    let preview_outcomes = preview_first["outcomes"].as_array().unwrap();
+    let preview_cfg = preview_outcomes
+        .iter()
+        .find(|item| item["label"] == "OpenAI/Codex client config")
+        .unwrap();
+    assert_eq!(
+        preview_cfg["path"],
+        Value::from(root.join(".codex/config.toml").display().to_string())
+    );
+    assert_eq!(preview_cfg["status"], Value::from("created"));
+    assert!(!root.join(".codex/config.toml").exists());
+
+    let apply_first = command_json_with_config_home(
+        root,
+        &[
+            "add",
+            "git",
+            "--host",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--format",
+            "json-pretty",
+        ],
+    );
+    let apply_cfg = apply_first["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "OpenAI/Codex client config")
+        .unwrap();
+    assert_eq!(apply_cfg["path"], preview_cfg["path"]);
+    assert_eq!(apply_cfg["status"], preview_cfg["status"]);
+
+    // Second preview and apply must both report skipped (idempotence + preview/apply match)
+    let preview_second = command_json_with_config_home(
+        root,
+        &[
+            "add",
+            "git",
+            "--host",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--preview",
+            "--format",
+            "json-pretty",
+        ],
+    );
+    let preview_second_cfg = preview_second["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "OpenAI/Codex client config")
+        .unwrap();
+    assert_eq!(preview_second_cfg["status"], Value::from("skipped"));
+
+    let apply_second = command_json_with_config_home(
+        root,
+        &[
+            "add",
+            "git",
+            "--host",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--format",
+            "json-pretty",
+        ],
+    );
+    let apply_second_cfg = apply_second["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "OpenAI/Codex client config")
+        .unwrap();
+    assert_eq!(apply_second_cfg["status"], Value::from("skipped"));
+
+    // Adding a second tool preserves the first managed server in .codex/config.toml
+    let preview_ls = command_json_with_config_home(
+        root,
+        &[
+            "add",
+            "ls",
+            "--host",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--allow-low-confidence",
+            "--preview",
+            "--format",
+            "json-pretty",
+        ],
+    );
+    let preview_ls_cfg = preview_ls["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "OpenAI/Codex client config")
+        .unwrap();
+    assert_eq!(preview_ls_cfg["status"], Value::from("updated"));
+
+    let apply_ls = command_json_with_config_home(
+        root,
+        &[
+            "add",
+            "ls",
+            "--host",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--allow-low-confidence",
+            "--format",
+            "json-pretty",
+        ],
+    );
+    let apply_ls_cfg = apply_ls["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["label"] == "OpenAI/Codex client config")
+        .unwrap();
+    assert_eq!(apply_ls_cfg["status"], Value::from("updated"));
+
+    let contents = fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    let parsed: toml::Table = toml::from_str(&contents).unwrap();
+    assert!(parsed["mcp_servers"]["sxmc-cli-ai-git"].is_table());
+    assert!(parsed["mcp_servers"]["sxmc-cli-ai-ls"].is_table());
+
+    // Removing git removes only sxmc-cli-ai-git and preserves sxmc-cli-ai-ls
+    sxmc_with_config_home(root)
+        .args([
+            "init",
+            "ai",
+            "--from-cli",
+            "git",
+            "--client",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--mode",
+            "apply",
+            "--remove",
+        ])
+        .assert()
+        .success();
+
+    let after_remove = fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+    let parsed_after: toml::Table = toml::from_str(&after_remove).unwrap();
+    assert!(parsed_after["mcp_servers"].get("sxmc-cli-ai-git").is_none());
+    assert!(parsed_after["mcp_servers"]["sxmc-cli-ai-ls"].is_table());
+}
+
+#[test]
+fn test_codex_refuses_unmanaged_conflict_and_invalid_toml_in_preview_and_apply() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex_dir = temp.path().join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let config_path = codex_dir.join("config.toml");
+
+    // 1. Unmanaged server with the same name outside sxmc markers
+    let conflict_body = concat!(
+        "# User owns this server\n",
+        "[mcp_servers.sxmc-cli-ai-gh]\n",
+        "command = \"custom-tool\"\n",
+        "args = [\"serve\"]\n",
+        "\n",
+        "[mcp_servers.sxmc-cli-ai-git]\n",
+        "command = \"custom-git\"\n",
+        "args = [\"serve\"]\n",
+    );
+    fs::write(&config_path, conflict_body).unwrap();
+
+    for mode in ["patch", "apply"] {
+        sxmc_with_config_home(temp.path())
+            .args([
+                "scaffold",
+                "client-config",
+                "--from-profile",
+                "examples/profiles/from_cli.json",
+                "--client",
+                "openai-codex",
+                "--root",
+                temp.path().to_str().unwrap(),
+                "--mode",
+                mode,
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unmanaged"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), conflict_body);
+    }
+
+    // Remove must not delete user-owned server when there is no managed block
+    if has_command("git") {
+        sxmc_with_config_home(temp.path())
+            .args([
+                "init",
+                "ai",
+                "--from-cli",
+                "git",
+                "--client",
+                "openai-codex",
+                "--root",
+                temp.path().to_str().unwrap(),
+                "--mode",
+                "apply",
+                "--remove",
+            ])
+            .assert()
+            .success();
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), conflict_body);
+    }
+
+    // 2. Invalid TOML must be rejected without modifying the file
+    let invalid_body = "[broken\ncommand = \"oops\"\n";
+    fs::write(&config_path, invalid_body).unwrap();
+    for mode in ["patch", "apply"] {
+        sxmc_with_config_home(temp.path())
+            .args([
+                "scaffold",
+                "client-config",
+                "--from-profile",
+                "examples/profiles/from_cli.json",
+                "--client",
+                "openai-codex",
+                "--root",
+                temp.path().to_str().unwrap(),
+                "--mode",
+                mode,
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("valid TOML"));
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), invalid_body);
+    }
+
+    // 3. Unclosed managed markers must be rejected without corrupting the file
+    let broken_markers =
+        "# sxmc:begin cli-ai:openai-codex\n[mcp_servers.sxmc-cli-ai-gh]\ncommand = \"sxmc\"\n";
+    fs::write(&config_path, broken_markers).unwrap();
+    sxmc_with_config_home(temp.path())
+        .args([
+            "scaffold",
+            "client-config",
+            "--from-profile",
+            "examples/profiles/from_cli.json",
+            "--client",
+            "openai-codex",
+            "--root",
+            temp.path().to_str().unwrap(),
+            "--mode",
+            "apply",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("markers"));
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), broken_markers);
+}
+
+#[test]
+fn test_codex_global_default_and_codex_home_destinations() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let custom_codex_home = temp.path().join("custom-codex-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&custom_codex_home).unwrap();
+
+    // Default global destination ($HOME/.codex/config.toml) when CODEX_HOME is unset
+    sxmc_with_config_home(&home)
+        .args([
+            "scaffold",
+            "client-config",
+            "--from-profile",
+            "examples/profiles/from_cli.json",
+            "--client",
+            "openai-codex",
+            "--global",
+            "--mode",
+            "apply",
+        ])
+        .assert()
+        .success();
+
+    let default_global_cfg = home.join(".codex").join("config.toml");
+    assert!(default_global_cfg.exists());
+    assert!(!home.join(".codex").join("mcp.toml").exists());
+
+    let status_default = command_json_with_config_home(
+        &home,
+        &[
+            "status",
+            "--global",
+            "--host",
+            "openai-codex",
+            "--format",
+            "json-pretty",
+        ],
+    );
+    assert_eq!(
+        status_default["startup_files"]["openai_codex_mcp"]["path"],
+        Value::from(default_global_cfg.display().to_string())
+    );
+    assert_eq!(
+        status_default["startup_files"]["openai_codex_mcp"]["present"],
+        Value::from(true)
+    );
+
+    // Custom CODEX_HOME overrides default global destination for config.toml and AGENTS.md
+    sxmc_with_config_home(&home)
+        .env("CODEX_HOME", &custom_codex_home)
+        .args([
+            "scaffold",
+            "client-config",
+            "--from-profile",
+            "examples/profiles/from_cli.json",
+            "--client",
+            "openai-codex",
+            "--global",
+            "--mode",
+            "apply",
+        ])
+        .assert()
+        .success();
+
+    let custom_global_cfg = custom_codex_home.join("config.toml");
+    assert!(custom_global_cfg.exists());
+    assert!(!custom_codex_home.join("mcp.toml").exists());
+
+    let status_custom = sxmc_with_config_home(&home)
+        .env("CODEX_HOME", &custom_codex_home)
+        .args([
+            "status",
+            "--global",
+            "--host",
+            "openai-codex",
+            "--format",
+            "json-pretty",
+        ])
+        .output()
+        .unwrap();
+    assert!(status_custom.status.success());
+    let status_custom_json: Value = serde_json::from_slice(&status_custom.stdout).unwrap();
+    assert_eq!(
+        status_custom_json["startup_files"]["openai_codex_mcp"]["path"],
+        Value::from(custom_global_cfg.display().to_string())
+    );
+    assert_eq!(
+        status_custom_json["startup_files"]["openai_codex_agent_doc"]["path"],
+        Value::from(custom_codex_home.join("AGENTS.md").display().to_string())
+    );
+}
+
+#[test]
+fn test_codex_upgrade_and_remove_preserve_legacy_mcp_toml_and_sidecar_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let isolated_path = onboarding_fixture_path(root, &["fixture-notes"]);
+    let codex_dir = root.join(".codex");
+    let legacy_sidecar_dir = root.join(".sxmc/ai/openai-codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::create_dir_all(&legacy_sidecar_dir).unwrap();
+
+    let legacy_path = codex_dir.join("mcp.toml");
+    let legacy_bytes = concat!(
+        "# sxmc:begin cli-ai:openai-codex\n",
+        "# sxmc CLI->AI startup scaffold\n",
+        "[mcp_servers.sxmc-cli-ai-legacy]\n",
+        "command = \"sxmc\"\n",
+        "args = [\"serve\", \"--paths\", \"/tmp/skills\"]\n",
+        "# sxmc:end cli-ai:openai-codex\n",
+    )
+    .as_bytes()
+    .to_vec();
+    fs::write(&legacy_path, &legacy_bytes).unwrap();
+
+    let legacy_sidecar_path = legacy_sidecar_dir.join("mcp.toml.sxmc.snippet");
+    let legacy_sidecar_bytes = b"# legacy sidecar snapshot\n[mcp_servers.sxmc-cli-ai-legacy]\n";
+    fs::write(&legacy_sidecar_path, legacy_sidecar_bytes).unwrap();
+
+    let config_path = codex_dir.join("config.toml");
+
+    // `add` auto-detects Codex from legacy .codex/mcp.toml without --host,
+    // writes fresh .codex/config.toml, and leaves legacy mcp.toml + old sidecar byte-identical.
+    let add_out = sxmc_with_onboarding_tools(root, &isolated_path)
+        .args([
+            "add",
+            "fixture-notes",
+            "--root",
+            root.to_str().unwrap(),
+            "--format",
+            "json-pretty",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add_out.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let add_json: Value = serde_json::from_slice(&add_out.stdout).unwrap();
+    let hosts = add_json["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(hosts.contains(&"openai-codex"));
+
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+    assert_eq!(
+        fs::read(&legacy_sidecar_path).unwrap(),
+        legacy_sidecar_bytes
+    );
+
+    let generated_cfg = fs::read_to_string(&config_path).unwrap();
+    let parsed: toml::Table = toml::from_str(&generated_cfg).unwrap();
+    assert!(parsed["mcp_servers"]["sxmc-cli-ai-fixture-notes"].is_table());
+    assert!(parsed["mcp_servers"].get("sxmc-cli-ai-legacy").is_none());
+
+    // `sync --apply` leaves legacy mcp.toml and old sidecar byte-identical
+    sxmc_with_onboarding_tools(root, &isolated_path)
+        .args(["sync", "--root", root.to_str().unwrap(), "--apply"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+    assert_eq!(
+        fs::read(&legacy_sidecar_path).unwrap(),
+        legacy_sidecar_bytes
+    );
+
+    // `write-sidecar` writes new config.toml.sxmc.snippet and leaves old mcp.toml.sxmc.snippet byte-identical
+    sxmc_with_config_home(root)
+        .args([
+            "scaffold",
+            "client-config",
+            "--from-profile",
+            "examples/profiles/from_cli.json",
+            "--client",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--mode",
+            "write-sidecar",
+        ])
+        .assert()
+        .success();
+    assert!(legacy_sidecar_dir.join("config.toml.sxmc.snippet").exists());
+    assert_eq!(
+        fs::read(&legacy_sidecar_path).unwrap(),
+        legacy_sidecar_bytes
+    );
+
+    // `--remove` removes only .codex/config.toml entry and leaves legacy mcp.toml + old sidecar byte-identical
+    sxmc_with_onboarding_tools(root, &isolated_path)
+        .args([
+            "init",
+            "ai",
+            "--from-cli",
+            "fixture-notes",
+            "--client",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--mode",
+            "apply",
+            "--remove",
+        ])
+        .assert()
+        .success();
+    assert!(!config_path.exists());
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+    assert_eq!(
+        fs::read(&legacy_sidecar_path).unwrap(),
+        legacy_sidecar_bytes
+    );
+}
+
+#[test]
+fn test_codex_sidecar_writes_config_toml_snippet_without_touching_real_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let codex_dir = root.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let real_cfg = codex_dir.join("config.toml");
+    fs::write(&real_cfg, "model = \"gpt-6.2-sol\"\n").unwrap();
+
+    sxmc_with_config_home(root)
+        .args([
+            "scaffold",
+            "client-config",
+            "--from-profile",
+            "examples/profiles/from_cli.json",
+            "--client",
+            "openai-codex",
+            "--root",
+            root.to_str().unwrap(),
+            "--mode",
+            "write-sidecar",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(&real_cfg).unwrap(),
+        "model = \"gpt-6.2-sol\"\n"
+    );
+    let sidecar = root.join(".sxmc/ai/openai-codex/config.toml.sxmc.snippet");
+    assert!(sidecar.exists());
+    assert!(!root
+        .join(".sxmc/ai/openai-codex/mcp.toml.sxmc.snippet")
+        .exists());
+    let sidecar_body = fs::read_to_string(&sidecar).unwrap();
+    let parsed: toml::Table = toml::from_str(&sidecar_body).unwrap();
+    assert!(parsed["mcp_servers"]["sxmc-cli-ai-gh"].is_table());
 }

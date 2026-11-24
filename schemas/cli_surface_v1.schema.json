@@ -150,8 +150,7 @@
     "option": {
       "type": "object",
       "required": [
-        "name",
-        "required"
+        "name"
       ],
       "properties": {
         "name": {
@@ -165,6 +164,15 @@
         },
         "required": {
           "type": "boolean"
+        },
+        "required_source": {
+          "type": "string",
+          "enum": [
+            "usage_compulsory",
+            "usage_optional",
+            "usage_ambiguous",
+            "option_marker"
+          ]
         },
         "summary": {
           "type": "string"
@@ -187,6 +195,15 @@
         },
         "required": {
           "type": "boolean"
+        },
+        "required_source": {
+          "type": "string",
+          "enum": [
+            "usage_compulsory",
+            "usage_optional",
+            "usage_ambiguous",
+            "option_marker"
+          ]
         },
         "summary": {
           "type": "string"

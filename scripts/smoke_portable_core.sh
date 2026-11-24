@@ -47,11 +47,7 @@ if [[ ! -f "${MANIFEST_DIR}/traffic-traffic.json" ]]; then
   exit 1
 fi
 
-SPEC="$("$PYTHON_BIN" - <<PY
-import json
-print(json.dumps(["${BIN}", "serve", "--discovery-tool-manifest", "${MANIFEST_DIR}"]))
-PY
-)"
+SPEC="$(mcp_serve_spec "$PYTHON_BIN" "$BIN" --discovery-tool-manifest "$MANIFEST_DIR")"
 
 "${BIN}" stdio "${SPEC}" --list-tools >"${TMPDIR}/tool-list.txt"
 grep -q "discovery__traffic" "${TMPDIR}/tool-list.txt"

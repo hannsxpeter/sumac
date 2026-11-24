@@ -8,6 +8,7 @@ pub mod mcp_scanner;
 pub mod patterns;
 pub mod skill_scanner;
 
+use std::cmp::Reverse;
 use std::fmt;
 
 /// Severity level for security findings.
@@ -134,7 +135,7 @@ impl ScanReport {
         )];
 
         let mut sorted = self.findings.clone();
-        sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
+        sorted.sort_by_key(|f| Reverse(f.severity));
 
         for f in &sorted {
             lines.push(format!("  {}", f));

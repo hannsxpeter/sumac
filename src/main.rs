@@ -4306,10 +4306,12 @@ fn format_status_report(value: &Value) -> String {
         if !changed.is_empty() {
             lines.push("Changed profiles:".into());
             for entry in changed {
+                let detail = summarize_flag_diff_brief(&entry["diff"]);
                 lines.push(format!(
-                    "- {} ({})",
+                    "- {} ({}){}",
                     entry["command"].as_str().unwrap_or("<unknown>"),
-                    entry["path"].as_str().unwrap_or("<unknown>")
+                    entry["path"].as_str().unwrap_or("<unknown>"),
+                    detail
                 ));
             }
         }
@@ -4515,14 +4517,16 @@ fn print_drift_report(value: &Value) {
                     error
                 );
             } else {
+                let detail = summarize_flag_diff_brief(&entry["diff"]);
                 println!(
-                    "- {}: {}",
+                    "- {}: {}{}",
                     entry["command"].as_str().unwrap_or("<unknown>"),
                     if entry["changed"].as_bool().unwrap_or(false) {
                         "changed"
                     } else {
                         "unchanged"
-                    }
+                    },
+                    detail
                 );
             }
         }
@@ -4703,6 +4707,28 @@ fn format_batch_toon(value: &Value, compact: bool) -> String {
     lines.join("\n")
 }
 
+fn summarize_flag_diff_brief(diff: &Value) -> String {
+    let mut parts = Vec::new();
+    for (label, key) in [
+        ("became_required", "options_became_required"),
+        ("became_optional", "options_became_optional"),
+        ("nested_added", "nested_options_added"),
+        ("nested_removed", "nested_options_removed"),
+    ] {
+        if let Some(items) = diff[key].as_array() {
+            let names: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+            if !names.is_empty() {
+                parts.push(format!("{label}: [{}]", names.join(", ")));
+            }
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join("; "))
+    }
+}
+
 fn format_diff_toon(value: &Value) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -4743,6 +4769,26 @@ fn format_diff_toon(value: &Value) -> String {
     );
     add_list(&mut lines, "options_added", &value["options_added"]);
     add_list(&mut lines, "options_removed", &value["options_removed"]);
+    add_list(
+        &mut lines,
+        "options_became_required",
+        &value["options_became_required"],
+    );
+    add_list(
+        &mut lines,
+        "options_became_optional",
+        &value["options_became_optional"],
+    );
+    add_list(
+        &mut lines,
+        "nested_options_added",
+        &value["nested_options_added"],
+    );
+    add_list(
+        &mut lines,
+        "nested_options_removed",
+        &value["nested_options_removed"],
+    );
     add_list(&mut lines, "environment_added", &value["environment_added"]);
     add_list(
         &mut lines,
@@ -4796,6 +4842,26 @@ fn diff_value_has_changes(value: &Value) -> bool {
             .map(|items| items.is_empty())
             .unwrap_or(true)
         || !value["options_removed"]
+            .as_array()
+            .map(|items| items.is_empty())
+            .unwrap_or(true)
+        || !value["options_became_required"]
+            .as_array()
+            .map(|items| items.is_empty())
+            .unwrap_or(true)
+        || !value["options_became_optional"]
+            .as_array()
+            .map(|items| items.is_empty())
+            .unwrap_or(true)
+        || !value["nested_options_added"]
+            .as_array()
+            .map(|items| items.is_empty())
+            .unwrap_or(true)
+        || !value["nested_options_removed"]
+            .as_array()
+            .map(|items| items.is_empty())
+            .unwrap_or(true)
+        || !value["option_changes"]
             .as_array()
             .map(|items| items.is_empty())
             .unwrap_or(true)
@@ -5089,6 +5155,10 @@ fn format_diff_markdown(value: &Value) -> String {
     push_section("Removed subcommands", &value["subcommands_removed"]);
     push_section("Added options", &value["options_added"]);
     push_section("Removed options", &value["options_removed"]);
+    push_section("Options became required", &value["options_became_required"]);
+    push_section("Options became optional", &value["options_became_optional"]);
+    push_section("Added nested options", &value["nested_options_added"]);
+    push_section("Removed nested options", &value["nested_options_removed"]);
     push_section("Added environment", &value["environment_added"]);
     push_section("Removed environment", &value["environment_removed"]);
     lines.join("\n")
@@ -6555,6 +6625,10 @@ pub(crate) fn auto_detect_add_hosts(install_paths: &InstallPaths) -> Vec<AiClien
                     .host_config_path(client)
                     .map(|path| path.exists())
                     .unwrap_or(false);
+                let has_legacy_config = install_paths
+                    .legacy_host_config_path(client)
+                    .map(|path| cli_surfaces::has_managed_toml_block(&path, spec.sidecar_scope))
+                    .unwrap_or(false);
                 let has_doc = install_paths
                     .host_doc_path(client)
                     .map(|path| path.exists())
@@ -6567,7 +6641,11 @@ pub(crate) fn auto_detect_add_hosts(install_paths: &InstallPaths) -> Vec<AiClien
                     AiClientProfile::OpenCode | AiClientProfile::OpenaiCodex
                 );
 
-                if has_config || (has_doc && !shared_doc_only) || runtime_detected {
+                if has_config
+                    || has_legacy_config
+                    || (has_doc && !shared_doc_only)
+                    || runtime_detected
+                {
                     Some(client)
                 } else {
                     None
@@ -6685,9 +6763,11 @@ fn render_runtime_client_config(
 ) -> String {
     match (client, registration) {
         (AiClientProfile::OpenaiCodex, RuntimeMcpRegistration::Stdio { command, args }) => {
-            let args_json = serde_json::to_string(args).unwrap_or_else(|_| "[]".into());
-            format!(
-                "# sxmc MCP registration\n[mcp_servers.{server_name}]\ncommand = {command:?}\nargs = {args_json}\n"
+            cli_surfaces::render_codex_mcp_server_toml(
+                "# sxmc MCP registration",
+                server_name,
+                command,
+                args,
             )
         }
         (AiClientProfile::OpenCode, RuntimeMcpRegistration::Stdio { command, args }) => {
@@ -7309,6 +7389,85 @@ pub(crate) fn sync_saved_profiles_value(
     apply: bool,
     allow_low_confidence: bool,
 ) -> Result<Value> {
+    sync_saved_profiles_with(
+        install_paths,
+        only_hosts,
+        skills_path,
+        apply,
+        allow_low_confidence,
+        cli_surfaces::inspect_cli_with_depth,
+        |path, bytes| stage_sync_profile(path, bytes, |file, bytes| file.write_all(bytes)),
+    )
+}
+
+struct StagedSyncProfile {
+    file: tempfile::NamedTempFile,
+    target: PathBuf,
+}
+
+impl StagedSyncProfile {
+    fn persist(self) -> Result<()> {
+        self.file.persist(&self.target).map_err(|error| {
+            sxmc::error::SxmcError::Other(format!(
+                "Could not replace saved profile '{}': {}",
+                self.target.display(),
+                error.error,
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+fn stage_sync_profile(
+    path: &Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<StagedSyncProfile> {
+    // A saved profile can be a symlink. Replace its resolved file and keep the link in place.
+    let target = fs::canonicalize(path).map_err(|error| {
+        sxmc::error::SxmcError::Other(format!(
+            "Could not resolve saved profile '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let parent = target.parent().ok_or_else(|| {
+        sxmc::error::SxmcError::Other(format!(
+            "Saved profile '{}' has no parent directory",
+            target.display()
+        ))
+    })?;
+    let stage = || -> std::io::Result<tempfile::NamedTempFile> {
+        let permissions = fs::OpenOptions::new()
+            .write(true)
+            .open(&target)?
+            .metadata()?
+            .permissions();
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        write(file.as_file_mut(), bytes)?;
+        file.as_file().set_permissions(permissions)?;
+        file.as_file().sync_all()?;
+        Ok(file)
+    };
+    let file = stage().map_err(|error| {
+        sxmc::error::SxmcError::Other(format!(
+            "Could not stage saved profile '{}' (target '{}') in '{}': {error}. Ensure the profile and its directory are writable.",
+            path.display(),
+            target.display(),
+            parent.display()
+        ))
+    })?;
+    Ok(StagedSyncProfile { file, target })
+}
+
+fn sync_saved_profiles_with(
+    install_paths: &InstallPaths,
+    only_hosts: &[AiClientProfile],
+    skills_path: &Path,
+    apply: bool,
+    allow_low_confidence: bool,
+    inspect: impl Fn(&str, bool, usize) -> Result<cli_surfaces::CliSurfaceProfile>,
+    stage_profile: impl Fn(&Path, &[u8]) -> Result<StagedSyncProfile>,
+) -> Result<Value> {
     let profile_dir = default_saved_profiles_dir(install_paths);
     let state_path = default_sync_state_path(install_paths);
     let selected_hosts = if only_hosts.is_empty() {
@@ -7342,7 +7501,7 @@ pub(crate) fn sync_saved_profiles_value(
                 let depth = profile_generation_depth(&saved_profile);
                 let executable = profile_command_executable(&saved_profile.command);
                 let executable_fingerprint = cli_surfaces::executable_fingerprint(&executable);
-                match cli_surfaces::inspect_cli_with_depth(&saved_profile.command, true, depth) {
+                match inspect(&saved_profile.command, true, depth) {
                     Ok(refreshed_profile) => {
                         let diff =
                             cli_surfaces::diff_profile_value(&saved_profile, &refreshed_profile);
@@ -7365,12 +7524,14 @@ pub(crate) fn sync_saved_profiles_value(
                         let profile_outcome = sync_profile_write_outcome(path, mode, changed);
                         profile_outcomes.push(profile_outcome.clone());
 
-                        if changed && apply {
-                            if let Some(parent) = path.parent() {
-                                fs::create_dir_all(parent)?;
-                            }
-                            fs::write(path, serde_json::to_string_pretty(&refreshed_profile)?)?;
-                        }
+                        let staged_profile = if changed && apply {
+                            Some(stage_profile(
+                                path,
+                                &serde_json::to_vec_pretty(&refreshed_profile)?,
+                            )?)
+                        } else {
+                            None
+                        };
 
                         let mut artifact_mode = "not_needed";
                         let mut blocked_reason = Value::Null;
@@ -7419,6 +7580,10 @@ pub(crate) fn sync_saved_profiles_value(
                                     "Profile quality is below the startup-doc threshold. Re-run with --allow-low-confidence to refresh AI-host artifacts too.",
                                 );
                             }
+                        }
+
+                        if let Some(staged_profile) = staged_profile {
+                            staged_profile.persist()?;
                         }
 
                         artifact_outcomes.extend(entry_artifact_outcomes.iter().cloned());
@@ -7579,6 +7744,13 @@ pub(crate) fn format_sync_report(value: &Value) -> String {
                     entry["command"].as_str().unwrap_or("<unknown>"),
                     entry["state"].as_str().unwrap_or("pending")
                 ));
+                let detail = summarize_flag_diff_brief(&entry["diff"]);
+                if !detail.is_empty() {
+                    lines.push(format!(
+                        "  diff: {}",
+                        detail.trim_start_matches(" (").trim_end_matches(')')
+                    ));
+                }
                 if let Some(reason) = entry["blocked_reason"].as_str() {
                     lines.push(format!("  note: {}", reason));
                 }
@@ -10029,8 +10201,8 @@ async fn main() -> Result<()> {
             pretty,
             format,
         } => {
-            let outcome = app::golden_path::GoldenPathApp::current().run_add(
-                app::add::AddRequest {
+            let outcome =
+                app::golden_path::GoldenPathApp::current().run_add(app::add::AddRequest {
                     command,
                     depth,
                     install_paths: resolve_install_paths(root, global, local)?,
@@ -10041,8 +10213,7 @@ async fn main() -> Result<()> {
                     allow_self,
                     pretty,
                     format,
-                },
-            )?;
+                })?;
             if let Some(code) = outcome.exit_code {
                 std::process::exit(code);
             }
@@ -10063,8 +10234,8 @@ async fn main() -> Result<()> {
             pretty,
             format,
         } => {
-            let outcome = app::golden_path::GoldenPathApp::current().run_setup(
-                app::setup::SetupRequest {
+            let outcome =
+                app::golden_path::GoldenPathApp::current().run_setup(app::setup::SetupRequest {
                     tools,
                     limit,
                     depth,
@@ -10076,8 +10247,7 @@ async fn main() -> Result<()> {
                     allow_self,
                     pretty,
                     format,
-                },
-            )?;
+                })?;
             if let Some(code) = outcome.exit_code {
                 std::process::exit(code);
             }
@@ -10592,8 +10762,8 @@ async fn main() -> Result<()> {
             pretty,
             format,
         } => {
-            let outcome = app::golden_path::GoldenPathApp::current().run_sync(
-                app::sync::SyncRequest {
+            let outcome =
+                app::golden_path::GoldenPathApp::current().run_sync(app::sync::SyncRequest {
                     install_paths: resolve_install_paths(root, global, local)?,
                     only_hosts,
                     skills_path,
@@ -10602,8 +10772,7 @@ async fn main() -> Result<()> {
                     allow_low_confidence,
                     pretty,
                     format,
-                },
-            )?;
+                })?;
             if let Some(code) = outcome.exit_code {
                 std::process::exit(code);
             }
@@ -10651,6 +10820,27 @@ async fn main() -> Result<()> {
                 std::process::exit(code);
             }
         }
+        Commands::Check {
+            root,
+            manifest,
+            format,
+            timeout_seconds,
+            max_output_bytes,
+        } => {
+            let root = root
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let code = sxmc::check::run_cli(sxmc::check::CheckRunConfig {
+                root,
+                manifest,
+                format,
+                timeout_seconds,
+                max_output_bytes,
+            })
+            .await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
     }
 
     Ok(())
@@ -10664,6 +10854,145 @@ mod tests {
     };
     use sxmc::error::SxmcError;
     use sxmc::output::StructuredOutputFormat;
+
+    #[test]
+    fn sync_retries_after_a_partial_profile_write() {
+        use super::{
+            fs, stage_sync_profile, sync_saved_profiles_with, AiClientProfile, InstallPaths,
+        };
+        use std::io::{self, Write};
+        use std::path::Path;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = InstallPaths::local(temp.path().to_path_buf());
+        let profile_dir = paths.profile_dir();
+        fs::create_dir_all(&profile_dir).unwrap();
+        let path = profile_dir.join("fixture.json");
+        let mut refreshed: sxmc::cli_surfaces::CliSurfaceProfile =
+            serde_json::from_str(include_str!("../examples/profiles/from_cli.json")).unwrap();
+        refreshed.command = "sxmc-fixture-cli".into();
+        let mut saved = refreshed.clone();
+        saved.summary = "Outdated fixture summary".into();
+        let original = serde_json::to_vec_pretty(&saved).unwrap();
+        fs::write(&path, &original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        let config = temp.path().join(".codex/config.toml");
+        let doc = temp.path().join("AGENTS.md");
+        let original_config = b"model = 'fixture'\n";
+        let original_doc = b"# Fixture guidance\n";
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, original_config).unwrap();
+        fs::write(&doc, original_doc).unwrap();
+        let sync = |apply, fail_write| {
+            sync_saved_profiles_with(
+                &paths,
+                &[AiClientProfile::OpenaiCodex],
+                Path::new(".claude/skills"),
+                apply,
+                true,
+                |command, _, _| {
+                    assert_eq!(command, refreshed.command);
+                    Ok(refreshed.clone())
+                },
+                |target, bytes| {
+                    stage_sync_profile(target, bytes, |file, bytes| {
+                        if fail_write {
+                            file.write_all(&bytes[..4])?;
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "fixture denied profile staging after a partial write",
+                            ));
+                        }
+                        file.write_all(bytes)
+                    })
+                },
+            )
+        };
+        let preview = sync(false, true).unwrap();
+        assert_eq!(preview["entries"][0]["state"], "pending");
+        assert_eq!(fs::read(&doc).unwrap(), original_doc);
+        assert_eq!(fs::read(&config).unwrap(), original_config);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!config.with_file_name("config.toml.sxmc.lock").exists());
+        assert!(!temp.path().join(".sxmc/state.json").exists());
+
+        let error = sync(true, true).unwrap_err().to_string();
+        assert!(error.contains("fixture denied profile staging after a partial write"));
+        assert!(error.contains(&format!("saved profile '{}'", path.display())));
+        assert!(error.contains(&format!(
+            "in '{}'",
+            profile_dir.canonicalize().unwrap().display()
+        )));
+        assert_eq!(fs::read(&doc).unwrap(), original_doc);
+        assert_eq!(fs::read(&config).unwrap(), original_config);
+        assert!(!config.with_file_name("config.toml.sxmc.lock").exists());
+        assert!(!temp.path().join(".sxmc/state.json").exists());
+        assert!(
+            fs::read(&path).unwrap() == original,
+            "partial write changed the saved profile"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().permissions(), permissions);
+        let files: Vec<_> = fs::read_dir(&profile_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, [path.file_name().unwrap()]);
+
+        let report = sync(true, false).unwrap();
+        assert_eq!(report["entries"][0]["state"], "applied");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&refreshed).unwrap()
+        );
+        assert_eq!(fs::metadata(&path).unwrap().permissions(), permissions);
+        assert_ne!(fs::read(&doc).unwrap(), original_doc);
+        let applied_config = fs::read_to_string(&config).unwrap();
+        let applied: toml::Table = toml::from_str(&applied_config).unwrap();
+        assert_eq!(applied["model"].as_str(), Some("fixture"));
+        assert_eq!(
+            applied["mcp_servers"]["sxmc-cli-ai-sxmc-fixture-cli"]["command"].as_str(),
+            Some("sxmc")
+        );
+        assert!(temp.path().join(".sxmc/state.json").is_file());
+        let unchanged = sync(true, true).unwrap();
+        assert_eq!(unchanged["entries"][0]["state"], "unchanged");
+        assert_eq!(fs::read_to_string(config).unwrap(), applied_config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_profile_replacement_preserves_a_relative_symlink() {
+        use super::{fs, stage_sync_profile};
+        use std::io::Write;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::path::Path;
+
+        let temp = tempfile::tempdir().unwrap();
+        let profiles = temp.path().join("profiles");
+        fs::create_dir(&profiles).unwrap();
+        let target = temp.path().join("actual.json");
+        let link = profiles.join("profile.json");
+        fs::write(&target, b"old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink("../actual.json", &link).unwrap();
+
+        let staged =
+            stage_sync_profile(&link, b"refresh", |file, bytes| file.write_all(bytes)).unwrap();
+        assert_eq!(fs::read(&link).unwrap(), b"old");
+        staged.persist().unwrap();
+
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("../actual.json"));
+        assert_eq!(fs::read(&link).unwrap(), b"refresh");
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
 
     #[test]
     fn detects_json_rpc_method_not_found_as_optional_capability_gap() {

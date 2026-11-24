@@ -748,18 +748,26 @@ fn normalize_relative_path(relative_path: &str) -> Result<String, McpError> {
     Ok(parts.join("/"))
 }
 
-fn managed_asset_by_relative_path<'a>(skill: &'a Skill, relative_path: &str) -> Option<&'a SkillAsset> {
-    skill.assets.iter().find(|asset| asset.relative_path == relative_path)
+fn managed_asset_by_relative_path<'a>(
+    skill: &'a Skill,
+    relative_path: &str,
+) -> Option<&'a SkillAsset> {
+    skill
+        .assets
+        .iter()
+        .find(|asset| asset.relative_path == relative_path)
 }
 
 fn list_skill_files(skill: &Skill) -> Result<Vec<String>, McpError> {
     let mut files = skill
         .assets
         .iter()
-        .filter(|asset| matches!(
-            asset.kind,
-            SkillAssetKind::SkillFile | SkillAssetKind::Script | SkillAssetKind::Reference
-        ))
+        .filter(|asset| {
+            matches!(
+                asset.kind,
+                SkillAssetKind::SkillFile | SkillAssetKind::Script | SkillAssetKind::Reference
+            )
+        })
         .map(|asset| asset.relative_path.clone())
         .collect::<Vec<_>>();
     files.sort();

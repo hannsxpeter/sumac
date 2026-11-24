@@ -7,9 +7,7 @@ use sxmc::error::Result;
 use sxmc::output;
 use sxmc::paths::InstallPaths;
 
-use crate::{
-    print_status_report, status_has_unhealthy_baked_health, status_value_with_health,
-};
+use crate::{print_status_report, status_has_unhealthy_baked_health, status_value_with_health};
 
 use super::{CommandOutcome, GoldenPathRoute};
 

@@ -60,15 +60,17 @@ impl AddService {
 
         emit_onboarding_header(render_format, &selection, &request.install_paths);
 
-        let onboarded = self.onboarding.inspect_and_materialize(MaterializeRequest {
-            command: &request.command,
-            depth: request.depth,
-            allow_self: request.allow_self,
-            allow_low_confidence: request.allow_low_confidence,
-            install_paths: &request.install_paths,
-            skills_path: &request.skills_path,
-            selection: &selection,
-        })?;
+        let onboarded = self
+            .onboarding
+            .inspect_and_materialize(MaterializeRequest {
+                command: &request.command,
+                depth: request.depth,
+                allow_self: request.allow_self,
+                allow_low_confidence: request.allow_low_confidence,
+                install_paths: &request.install_paths,
+                skills_path: &request.skills_path,
+                selection: &selection,
+            })?;
 
         if let Some(format) = render_format {
             let value = add_result_value(AddResultContext {
@@ -120,8 +122,11 @@ impl AddService {
             );
         }
 
-        let profile =
-            cli_surfaces::inspect_cli_with_depth(&request.command, request.allow_self, request.depth)?;
+        let profile = cli_surfaces::inspect_cli_with_depth(
+            &request.command,
+            request.allow_self,
+            request.depth,
+        )?;
         ensure_profile_ready_for_agent_docs(&profile, request.allow_low_confidence)?;
         let (artifacts, selected_hosts) = resolve_cli_ai_init_artifacts(
             &profile,

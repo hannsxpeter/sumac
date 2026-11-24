@@ -1,6 +1,6 @@
 use super::{
-    add::AddRequest, setup::SetupRequest, status::StatusRequest, sync::SyncRequest,
-    CommandOutcome, GoldenPathRoute,
+    add::AddRequest, setup::SetupRequest, status::StatusRequest, sync::SyncRequest, CommandOutcome,
+    GoldenPathRoute,
 };
 use sxmc::error::Result;
 
