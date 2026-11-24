@@ -13,6 +13,25 @@ pick_python() {
   exit 1
 }
 
+mcp_serve_spec() {
+  local python_bin="$1"
+  local binary="$2"
+  local path_flag="$3"
+  local input_path="$4"
+  # Git Bash does not convert paths embedded in JSON arguments.
+  if command -v cygpath >/dev/null 2>&1; then
+    binary="$(cygpath -m -- "$binary")" || return
+    input_path="$(cygpath -m -- "$input_path")" || return
+  fi
+  "$python_bin" - "$binary" "$path_flag" "$input_path" <<'PY'
+import json
+import sys
+
+binary, path_flag, input_path = sys.argv[1:]
+print(json.dumps([binary, "serve", path_flag, input_path]))
+PY
+}
+
 wait_for_health() {
   local url="$1"
   for _ in $(seq 1 40); do

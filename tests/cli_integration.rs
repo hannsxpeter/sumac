@@ -22,67 +22,40 @@ fn has_command(name: &str) -> bool {
         .is_ok()
 }
 
+#[cfg(unix)]
 fn find_command_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let dirs = std::env::split_paths(&path);
-
-    #[cfg(windows)]
-    let exts: Vec<String> = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-        .split(';')
-        .filter(|ext| !ext.is_empty())
-        .map(|ext| ext.to_ascii_lowercase())
-        .collect();
-
-    #[cfg(not(windows))]
-    let exts = vec![String::new()];
-
-    for dir in dirs {
-        for ext in &exts {
-            let candidate = if ext.is_empty() || name.to_ascii_lowercase().ends_with(ext) {
-                dir.join(name)
-            } else {
-                dir.join(format!("{name}{ext}"))
-            };
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
-#[cfg(unix)]
-fn create_command_wrapper(bin_dir: &Path, name: &str, target: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let script = bin_dir.join(name);
-    let body = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", target.display());
-    fs::write(&script, body).unwrap();
-    let mut perms = fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script, perms).unwrap();
-    script
-}
-
-#[cfg(windows)]
-fn create_command_wrapper(bin_dir: &Path, name: &str, target: &Path) -> PathBuf {
-    let script = bin_dir.join(format!("{name}.cmd"));
-    let body = format!("@echo off\r\n\"{}\" %*\r\n", target.display());
-    fs::write(&script, body).unwrap();
-    script
-}
-
-fn isolated_path_with_tools(root: &Path, names: &[&str]) -> String {
+fn onboarding_fixture_path(root: &Path, names: &[&str]) -> PathBuf {
     let bin_dir = root.join("isolated-bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-    for name in names {
-        let target = find_command_on_path(name)
-            .unwrap_or_else(|| panic!("expected {name} to exist on PATH for integration test"));
-        create_command_wrapper(&bin_dir, name, &target);
+    fs::create_dir(&bin_dir).unwrap();
+    let executable = |name| bin_dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let (first, rest) = names.split_first().expect("at least one onboarding tool");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/onboarding_cli.rs");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    Command::new(rustc)
+        .timeout(Duration::from_secs(60))
+        .arg(fixture)
+        .arg("-o")
+        .arg(executable(first))
+        .assert()
+        .success();
+    for name in rest {
+        fs::hard_link(executable(first), executable(name)).unwrap();
     }
-    bin_dir.to_string_lossy().into_owned()
+    bin_dir
+}
+
+fn sxmc_with_onboarding_tools(home: &Path, bin_dir: &Path) -> Command {
+    let mut command = sxmc_with_config_home(home);
+    command
+        .env("PATH", bin_dir)
+        .timeout(Duration::from_secs(30));
+    command
 }
 
 fn sxmc_with_config_home(home: &Path) -> Command {
@@ -4394,16 +4367,20 @@ fn test_init_ai_blocks_low_confidence_profiles_without_override() {
 #[test]
 fn test_add_applies_to_detected_hosts_and_saves_profile() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
     fs::write(
         temp.path().join("CLAUDE.md"),
         "# Existing Claude guidance\n",
     )
     .unwrap();
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
-        .args(["add", "git", "--root", temp.path().to_str().unwrap()])
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
+        .args([
+            "add",
+            "fixture-notes",
+            "--root",
+            temp.path().to_str().unwrap(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Detected AI hosts: Claude Code"))
@@ -4415,8 +4392,13 @@ fn test_add_applies_to_detected_hosts_and_saves_profile() {
         .join(".sxmc")
         .join("ai")
         .join("profiles")
-        .join("git.json");
-    assert!(profile_path.exists(), "expected git profile to be written");
+        .join("fixture-notes.json");
+    let profile: Value = serde_json::from_slice(&fs::read(&profile_path).unwrap()).unwrap();
+    assert_eq!(profile["command"], "fixture-notes");
+    assert_eq!(
+        profile["examples"][0]["command"],
+        "fixture-notes list --json"
+    );
     assert!(
         temp.path()
             .join(".sxmc")
@@ -4428,17 +4410,21 @@ fn test_add_applies_to_detected_hosts_and_saves_profile() {
 
     let claude = fs::read_to_string(temp.path().join("CLAUDE.md")).unwrap();
     assert!(claude.contains("sxmc:begin cli-ai:claude-code"));
-    assert!(claude.contains("git"));
+    assert!(claude.contains("fixture-notes"));
 }
 
 #[test]
 fn test_add_without_detected_hosts_previews_full_plan() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
-        .args(["add", "git", "--root", temp.path().to_str().unwrap()])
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
+        .args([
+            "add",
+            "fixture-notes",
+            "--root",
+            temp.path().to_str().unwrap(),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("No AI hosts detected"))
@@ -4452,7 +4438,7 @@ fn test_add_without_detected_hosts_previews_full_plan() {
         .join(".sxmc")
         .join("ai")
         .join("profiles")
-        .join("git.json");
+        .join("fixture-notes.json");
     assert!(
         !profile_path.exists(),
         "preview path should not write the profile yet"
@@ -4462,47 +4448,48 @@ fn test_add_without_detected_hosts_previews_full_plan() {
 #[test]
 fn test_add_supports_structured_output_and_client_alias() {
     let temp = tempfile::tempdir().unwrap();
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
     fs::write(
         temp.path().join("CLAUDE.md"),
         "# Existing Claude guidance\n",
     )
     .unwrap();
 
-    let value = command_json_with_config_home(
-        temp.path(),
-        &[
+    let result = sxmc_with_onboarding_tools(temp.path(), &isolated_path)
+        .args([
             "add",
-            "git",
+            "fixture-notes",
             "--client",
             "claude-code",
             "--root",
             temp.path().to_str().unwrap(),
             "--format",
             "json-pretty",
-        ],
-    );
+        ])
+        .assert()
+        .success();
+    let value: Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
 
     assert_eq!(value["command"], Value::from("add"));
-    assert_eq!(value["tool"], Value::from("git"));
+    assert_eq!(value["tool"], Value::from("fixture-notes"));
     assert_eq!(value["effective_mode"], Value::from("apply"));
     assert_eq!(value["auto_detected_hosts"], Value::from(false));
     assert_eq!(value["hosts"][0]["id"], Value::from("claude-code"));
-    assert_eq!(value["profile"]["command"], Value::from("git"));
+    assert_eq!(value["profile"]["command"], Value::from("fixture-notes"));
     assert!(value["outcome_summary"]["total"].as_u64().unwrap_or(0) > 0);
 }
 
 #[test]
 fn test_add_global_writes_user_level_host_artifacts_and_global_state() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
     let claude_dir = temp.path().join(".claude");
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(claude_dir.join("CLAUDE.md"), "# Existing Claude guidance\n").unwrap();
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
         .current_dir(temp.path())
-        .args(["add", "git", "--global"])
+        .args(["add", "fixture-notes", "--global"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Detected AI hosts: Claude Code"));
@@ -4513,7 +4500,7 @@ fn test_add_global_writes_user_level_host_artifacts_and_global_state() {
         .join("sxmc")
         .join("ai")
         .join("profiles")
-        .join("git.json")
+        .join("fixture-notes.json")
         .exists());
     assert!(temp
         .path()
@@ -4526,7 +4513,7 @@ fn test_add_global_writes_user_level_host_artifacts_and_global_state() {
 
     let claude = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
     assert!(claude.contains("sxmc:begin cli-ai:claude-code"));
-    assert!(claude.contains("git"));
+    assert!(claude.contains("fixture-notes"));
 }
 
 #[test]
@@ -4547,54 +4534,62 @@ fn test_status_global_reports_user_level_targets() {
         .unwrap();
 
     assert_eq!(value["install_scope"], Value::from("global"));
-    assert!(value["startup_files"]["claude_code"]["path"]
+    let reported_path = value["startup_files"]["claude_code"]["path"]
         .as_str()
-        .unwrap_or("")
-        .contains(".claude/CLAUDE.md"));
+        .unwrap();
+    assert_eq!(Path::new(reported_path), claude_dir.join("CLAUDE.md"));
 }
 
 #[test]
 fn test_setup_applies_multiple_tools_to_detected_hosts() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git", "ls"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes", "fixture-sparse"]);
     fs::write(
         temp.path().join("CLAUDE.md"),
         "# Existing Claude guidance\n",
     )
     .unwrap();
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
         .args([
             "setup",
             "--tool",
-            "git,ls",
+            "fixture-notes,fixture-sparse",
             "--allow-low-confidence",
             "--root",
             temp.path().to_str().unwrap(),
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Selected tools: git, ls"))
+        .stdout(predicate::str::contains(
+            "Selected tools: fixture-notes, fixture-sparse",
+        ))
         .stdout(predicate::str::contains("Detected AI hosts: Claude Code"))
-        .stdout(predicate::str::contains("Onboarding tool: git"))
-        .stdout(predicate::str::contains("Onboarding tool: ls"));
+        .stdout(predicate::str::contains("Onboarding tool: fixture-notes"))
+        .stdout(predicate::str::contains("Onboarding tool: fixture-sparse"));
 
-    assert!(temp.path().join(".sxmc/ai/profiles/git.json").exists());
-    assert!(temp.path().join(".sxmc/ai/profiles/ls.json").exists());
+    assert!(temp
+        .path()
+        .join(".sxmc/ai/profiles/fixture-notes.json")
+        .exists());
+    assert!(temp
+        .path()
+        .join(".sxmc/ai/profiles/fixture-sparse.json")
+        .exists());
     assert!(temp.path().join(".sxmc/ai/claude-code-mcp.json").exists());
 }
 
 #[test]
 fn test_setup_global_writes_multiple_profiles_into_global_state() {
     let temp = tempfile::tempdir().unwrap();
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes", "fixture-tasks"]);
     let claude_dir = temp.path().join(".claude");
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(claude_dir.join("CLAUDE.md"), "# Existing Claude guidance\n").unwrap();
 
-    sxmc_with_config_home(temp.path())
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
         .current_dir(temp.path())
-        .args(["setup", "--tool", "git,ls", "--global"])
+        .args(["setup", "--tool", "fixture-notes,fixture-tasks", "--global"])
         .assert()
         .success();
 
@@ -4602,12 +4597,12 @@ fn test_setup_global_writes_multiple_profiles_into_global_state() {
     assert!(config_root
         .join("ai")
         .join("profiles")
-        .join("git.json")
+        .join("fixture-notes.json")
         .exists());
     assert!(config_root
         .join("ai")
         .join("profiles")
-        .join("ls.json")
+        .join("fixture-tasks.json")
         .exists());
     assert!(config_root.join("ai").join("claude-code-mcp.json").exists());
 }
@@ -4615,26 +4610,28 @@ fn test_setup_global_writes_multiple_profiles_into_global_state() {
 #[test]
 fn test_setup_supports_structured_output_and_client_alias() {
     let temp = tempfile::tempdir().unwrap();
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes", "fixture-tasks"]);
     fs::write(
         temp.path().join("CLAUDE.md"),
         "# Existing Claude guidance\n",
     )
     .unwrap();
 
-    let value = command_json_with_config_home(
-        temp.path(),
-        &[
+    let result = sxmc_with_onboarding_tools(temp.path(), &isolated_path)
+        .args([
             "setup",
             "--tool",
-            "git,ls",
+            "fixture-notes,fixture-tasks",
             "--client",
             "claude-code",
             "--root",
             temp.path().to_str().unwrap(),
             "--format",
             "json-pretty",
-        ],
-    );
+        ])
+        .assert()
+        .success();
+    let value: Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
 
     assert_eq!(value["command"], Value::from("setup"));
     assert_eq!(value["effective_mode"], Value::from("apply"));
@@ -4644,32 +4641,37 @@ fn test_setup_supports_structured_output_and_client_alias() {
     assert_eq!(value["results"].as_array().unwrap().len(), 2);
     assert_eq!(
         value["results"][0]["profile"]["command"],
-        Value::from("git")
+        Value::from("fixture-notes")
     );
-    assert_eq!(value["results"][1]["profile"]["command"], Value::from("ls"));
+    assert_eq!(
+        value["results"][1]["profile"]["command"],
+        Value::from("fixture-tasks")
+    );
 }
 
 #[test]
 fn test_setup_previews_when_no_hosts_are_configured() {
     let temp = tempfile::tempdir().unwrap();
-    let isolated_path = isolated_path_with_tools(temp.path(), &["git"]);
+    let isolated_path = onboarding_fixture_path(temp.path(), &["fixture-notes"]);
 
-    sxmc_with_config_home(temp.path())
-        .env("PATH", &isolated_path)
+    sxmc_with_onboarding_tools(temp.path(), &isolated_path)
         .args([
             "setup",
             "--tool",
-            "git",
+            "fixture-notes",
             "--root",
             temp.path().to_str().unwrap(),
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Selected tools: git"))
+        .stdout(predicate::str::contains("Selected tools: fixture-notes"))
         .stdout(predicate::str::contains("No AI hosts detected"))
         .stdout(predicate::str::contains("Would create CLI profile:"));
 
-    assert!(!temp.path().join(".sxmc/ai/profiles/git.json").exists());
+    assert!(!temp
+        .path()
+        .join(".sxmc/ai/profiles/fixture-notes.json")
+        .exists());
 }
 
 #[test]
@@ -10515,13 +10517,9 @@ fn test_codex_global_default_and_codex_home_destinations() {
 
 #[test]
 fn test_codex_upgrade_and_remove_preserve_legacy_mcp_toml_and_sidecar_bytes() {
-    if !has_command("git") {
-        eprintln!("skipping: git not installed");
-        return;
-    }
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    let isolated_path = isolated_path_with_tools(root, &["git"]);
+    let isolated_path = onboarding_fixture_path(root, &["fixture-notes"]);
     let codex_dir = root.join(".codex");
     let legacy_sidecar_dir = root.join(".sxmc/ai/openai-codex");
     fs::create_dir_all(&codex_dir).unwrap();
@@ -10548,11 +10546,10 @@ fn test_codex_upgrade_and_remove_preserve_legacy_mcp_toml_and_sidecar_bytes() {
 
     // `add` auto-detects Codex from legacy .codex/mcp.toml without --host,
     // writes fresh .codex/config.toml, and leaves legacy mcp.toml + old sidecar byte-identical.
-    let add_out = sxmc_with_config_home(root)
-        .env("PATH", &isolated_path)
+    let add_out = sxmc_with_onboarding_tools(root, &isolated_path)
         .args([
             "add",
-            "git",
+            "fixture-notes",
             "--root",
             root.to_str().unwrap(),
             "--format",
@@ -10582,12 +10579,11 @@ fn test_codex_upgrade_and_remove_preserve_legacy_mcp_toml_and_sidecar_bytes() {
 
     let generated_cfg = fs::read_to_string(&config_path).unwrap();
     let parsed: toml::Table = toml::from_str(&generated_cfg).unwrap();
-    assert!(parsed["mcp_servers"]["sxmc-cli-ai-git"].is_table());
+    assert!(parsed["mcp_servers"]["sxmc-cli-ai-fixture-notes"].is_table());
     assert!(parsed["mcp_servers"].get("sxmc-cli-ai-legacy").is_none());
 
     // `sync --apply` leaves legacy mcp.toml and old sidecar byte-identical
-    sxmc_with_config_home(root)
-        .env("PATH", &isolated_path)
+    sxmc_with_onboarding_tools(root, &isolated_path)
         .args(["sync", "--root", root.to_str().unwrap(), "--apply"])
         .assert()
         .success();
@@ -10620,12 +10616,12 @@ fn test_codex_upgrade_and_remove_preserve_legacy_mcp_toml_and_sidecar_bytes() {
     );
 
     // `--remove` removes only .codex/config.toml entry and leaves legacy mcp.toml + old sidecar byte-identical
-    sxmc_with_config_home(root)
+    sxmc_with_onboarding_tools(root, &isolated_path)
         .args([
             "init",
             "ai",
             "--from-cli",
-            "git",
+            "fixture-notes",
             "--client",
             "openai-codex",
             "--root",

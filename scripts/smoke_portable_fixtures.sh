@@ -34,11 +34,7 @@ echo "Portable fixture smoke: skill discovery"
 "${BIN}" skills list --paths "${FIXTURES}" --json >"${TMPDIR}/skills.json"
 json_check "${TMPDIR}/skills.json" "d[0] is not None and d[1] is not None and d[2] is not None and d[3] is not None and [item['name'] for item in d].count('simple-skill') >= 1" "$PYTHON_BIN"
 
-SPEC="$("$PYTHON_BIN" - <<PY
-import json
-print(json.dumps(["${BIN}", "serve", "--paths", "${FIXTURES}"]))
-PY
-)"
+SPEC="$(mcp_serve_spec "$PYTHON_BIN" "$BIN" --paths "$FIXTURES")"
 
 echo "Portable fixture smoke: stdio MCP flow"
 "${BIN}" stdio "${SPEC}" --list >"${TMPDIR}/stdio-list.txt"

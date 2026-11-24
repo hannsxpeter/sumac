@@ -816,6 +816,8 @@ fn test_status_and_sync_detect_flag_requiredness_drift() {
         .args([
             "add",
             "opsctl",
+            "--host",
+            "claude-code",
             "--depth",
             "2",
             "--root",
@@ -965,6 +967,8 @@ fn test_h3_unknown_and_omitted_required_do_not_trigger_definitive_drift() {
         .args([
             "add",
             "opsctl",
+            "--host",
+            "claude-code",
             "--depth",
             "2",
             "--root",
