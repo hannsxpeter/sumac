@@ -72,15 +72,17 @@ impl SetupService {
             if render_format.is_none() {
                 println!("Onboarding tool: {}", command);
             }
-            let onboarded = self.onboarding.inspect_and_materialize(MaterializeRequest {
-                command,
-                depth: request.depth,
-                allow_self: request.allow_self,
-                allow_low_confidence: request.allow_low_confidence,
-                install_paths: &request.install_paths,
-                skills_path: &request.skills_path,
-                selection: &selection,
-            })?;
+            let onboarded = self
+                .onboarding
+                .inspect_and_materialize(MaterializeRequest {
+                    command,
+                    depth: request.depth,
+                    allow_self: request.allow_self,
+                    allow_low_confidence: request.allow_low_confidence,
+                    install_paths: &request.install_paths,
+                    skills_path: &request.skills_path,
+                    selection: &selection,
+                })?;
 
             if render_format.is_none() && selection.apply {
                 print_write_outcomes(&onboarded.outcomes);

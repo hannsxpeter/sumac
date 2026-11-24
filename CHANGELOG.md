@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-23
+
+### Added
+
+- `sxmc check` runs trusted local manifest checks that compare exact JSON
+  expected values, so false zero-job results fail the check instead of
+  silently passing
+
+### Changed
+
+- drift detection now covers nested scoped optional/required flag changes on
+  saved CLI profiles
+- crates.io and npm manifest metadata now point at the canonical repository,
+  `hannsxpeter/sumac`, while existing `aihxp/sumac` links keep redirecting
+
+### Fixed
+
+- managed Codex artifact writes now preserve the native Codex `config.toml`
+
 ## [1.0.10] - 2026-03-28
 
 ### Fixed

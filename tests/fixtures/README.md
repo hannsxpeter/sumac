@@ -15,6 +15,8 @@ Current fixture set:
   - skill with executable script tools for `skills run` and MCP tool execution
 - `stateful_mcp_server.py`
   - synthetic MCP fixture used by bake/session coverage
+- `failed-jobs`
+  - deterministic schema-drift workflow fixture for `sxmc check`
 
 These fixtures are intentionally:
 

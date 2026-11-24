@@ -13,6 +13,7 @@ The shortest path through `sxmc` is:
 - `wrap` to turn an existing CLI into a focused MCP server immediately
 - `api`, `spec`, and `graphql` for API-to-CLI flows
 - `inspect cli`, `init ai`, and `scaffold` for CLI-to-AI startup artifacts
+- `check` to verify local workflow scripts against `.sxmc/checks.toml`
 
 For the rewrite milestone, the maintained baseline for this lifecycle is
 captured in [GOLDEN_PATH_CONTRACT.md](GOLDEN_PATH_CONTRACT.md).
@@ -64,7 +65,7 @@ What each command does:
 - `sxmc status` shows configured hosts, stale knowledge, recovery hints, and sync state
 - `sxmc add <tool>` teaches Sumac and your AI hosts one additional CLI
 - `sxmc sync --apply` refreshes derived state after tools or profiles change
-- add `--global` when you want `CLAUDE.md`, `AGENTS.md`, Cursor rules/config, and related host artifacts written into user-level host locations instead of the repo
+- add `--global` when you want `CLAUDE.md`, `AGENTS.md`, Cursor rules/config, and related host artifacts written into user-level host locations instead of the repo (for Codex, `--global` honors `CODEX_HOME` and defaults to `~/.codex/config.toml` and `~/.codex/AGENTS.md`, while project-local writes target `.codex/config.toml`)
 - the rewrite-focused contract for this exact loop lives in
   [GOLDEN_PATH_CONTRACT.md](GOLDEN_PATH_CONTRACT.md)
 
@@ -465,9 +466,21 @@ Notes:
 - `sxmc inspect batch ... --since <timestamp>` skips commands whose executable
   has not changed since the given Unix-seconds or RFC3339 timestamp.
 - `sxmc inspect diff <tool> --before before.json` compares a live CLI against a
-  previously saved profile and reports added/removed options and subcommands.
+  previously saved profile and reports added/removed subcommands, added/removed
+  options, semantic flag requiredness transitions (`options_became_required` and
+  `options_became_optional`), nested command option changes (`nested_options_added`
+  and `nested_options_removed`), and per-path `option_changes` entries across
+  nested `subcommand_profiles`.
+- `sxmc inspect cli` detects unambiguous optional (`[--repo <NAME>]`) and
+  compulsory (`--repo <NAME>`) flags in usage and synopsis lines (recording
+  additive `required_source` evidence while omitting `required` when usage is
+  ambiguous or lacks usage evidence, and distinguishing optional flags with a
+  required operand). Both sides must have known `required` evidence (or an
+  explicit legacy `required` boolean) before `inspect diff`, `status`, or
+  `sync` declares a transition.
 - `sxmc inspect diff --before old.json --after new.json` compares two saved
-  profiles without needing the live tool on `PATH`.
+  profiles without needing the live tool on `PATH`, and `--exit-code` exits
+  non-zero for tracked semantic flag changes as well as `status` and `sync --check`.
 - `sxmc inspect drift .sxmc/ai/profiles --recursive` checks saved profile files
   against the currently installed commands and reports which ones changed.
 - `sxmc scaffold ci --from-profile <profile> --mode apply` generates a
@@ -536,7 +549,9 @@ Notes:
 - `sxmc inspect registry-pull <name> --registry ./registry` installs the latest
   matching bundle from a local registry into a profile directory.
 - `sxmc inspect diff --format markdown` renders a PR-friendly Markdown summary
-  of summary, subcommand, option, and environment deltas.
+  of summary, subcommand, option, flag requiredness, nested option, and
+  environment deltas (and `--format toon` / `--format json-pretty` render the
+  same tracked deltas).
 - `sxmc inspect diff --watch 3` re-runs the diff every three seconds, and each
   frame is flushed immediately so piped/non-interactive consumers can observe
   updates without waiting for process exit.
@@ -823,6 +838,86 @@ http://HOST:PORT/mcp
 ```
 
 with bearer auth or required headers enabled on the server.
+
+## Verify Local Workflows (`sxmc check`)
+
+`sxmc check` runs trusted project-local workflow commands sequentially from a
+`.sxmc/checks.toml` manifest without shell reinterpretation.
+
+```bash
+sxmc check
+sxmc check --root "tests/fixtures/failed-jobs"
+sxmc check --root "tests/fixtures/failed-jobs" --format json
+sxmc check --root "tests/fixtures/failed-jobs" --manifest "tests/fixtures/failed-jobs/checks-v2-drift.toml"
+```
+
+Options and defaults:
+
+- `--root <dir>`: project root containing `.sxmc/checks.toml` and working
+  directory for executed commands (defaults to current working directory)
+- `--manifest <path>`: explicit manifest file path (defaults to
+  `<root>/.sxmc/checks.toml`)
+- `--format <human|json>`: output format (`human` by default; `json` emits a
+  machine-readable JSON report on stdout even on failure or preflight error)
+- `--timeout-seconds <SECONDS>`: per-check timeout in seconds (default `30`,
+  valid range `1..=3600`)
+- `--max-output-bytes <BYTES>`: per-stream stdout and stderr byte limit per
+  check (default `1048576`, valid range `1..=67108864`); exceeding the limit
+  terminates and reaps the child
+
+Manifest schema (`version = 1`):
+
+```toml
+version = 1
+
+[[checks]]
+name = "failed-jobs-v1"
+argv = ["python3", "list_failed_jobs.py", "--mode", "v1"]
+expect_exit = 0
+
+[checks.json_types]
+"/failed_count" = "integer"
+"/failed_job_ids" = "array"
+"/last_error" = "null"
+
+[checks.json_equals]
+"/failed_count" = 1
+"/failed_job_ids" = ["job-17"]
+```
+
+- `expect_exit`: expected exit code in `0..=255` (defaults to `0`)
+- `json_types`: strict RFC 6901 JSON Pointer map (`""`, or `/...` with `~0`
+  for `~` and `~1` for `/`) to one of `null`, `boolean`, `number`, `integer`,
+  `string`, `array`, `object`; missing pointers are reported as `missing`
+  rather than `null`
+- `json_equals`: strict RFC 6901 JSON Pointer map to exact expected integer,
+  string, boolean, array, or object values; TOML floating-point and datetime
+  values are rejected in preflight at any nesting depth (use `json_types` with
+  `"number"` for decimal fields). Unrelated extra fields in command JSON pass,
+  and duplicate JSON object keys in command stdout are rejected as ambiguous.
+- `argv[0]`: on Windows, `.bat` / `.cmd` batch entry points are rejected at
+  preflight so literal `argv` execution never invokes `cmd.exe`
+
+Exit codes and error reporting:
+
+- `0`: all checks passed
+- `1`: at least one completed command failed an exit code, JSON parse
+  (including duplicate JSON object keys), or JSON assertion check (and no check
+  failed preflight or runner execution)
+- `2`: invalid CLI arguments, invalid or missing manifest, missing executable,
+  timeout, or output limit exceeded (exit `2` wins over exit `1`)
+- Argument-parsing exception: syntactically invalid CLI flags (such as
+  non-numeric or negative `--timeout-seconds` / `--max-output-bytes`, unknown
+  flags, or invalid `--format` values) are rejected by Clap before `sxmc check`
+  runs, exiting `2` with a diagnostic on `stderr` and empty `stdout` even when
+  `--format json` is passed. Post-parse preflight errors (such as
+  `--timeout-seconds 0`, `--max-output-bytes 0`, out-of-range bounds, missing
+  root/manifest, or invalid manifest rules) emit the JSON report on `stdout`
+  with `--format json`.
+- Optional diagnostics share a 128 KiB budget measured in encoded JSON bytes.
+  Large values may appear as previews. The report sets `truncated` when it
+  shortens or omits detail. Every check still has a result, and all assertions
+  contribute to that result.
 
 ## Agent Guidance
 

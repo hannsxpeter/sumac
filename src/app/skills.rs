@@ -4,9 +4,7 @@ use sxmc::error::Result;
 use sxmc::paths::InstallPaths;
 use sxmc::skills::{discovery, generator, install as skill_install};
 
-use crate::command_handlers::{
-    cmd_skills_info, cmd_skills_list, cmd_skills_run, SkillListOptions,
-};
+use crate::command_handlers::{cmd_skills_info, cmd_skills_list, cmd_skills_run, SkillListOptions};
 
 use super::CommandOutcome;
 

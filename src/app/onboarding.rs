@@ -99,11 +99,7 @@ impl OnboardingAdapters {
                 &selected_hosts,
             )?
         } else {
-            cli_surfaces::preview_artifacts(
-                &artifacts,
-                ArtifactMode::Apply,
-                request.install_paths,
-            )?
+            cli_surfaces::preview_artifacts(&artifacts, ArtifactMode::Apply, request.install_paths)?
         };
 
         Ok(OnboardedTool {
@@ -166,8 +162,6 @@ pub(crate) fn emit_onboarding_header(
             "No AI hosts detected for the {} install scope. Previewing the full onboarding plan instead.",
             install_paths.scope().as_str()
         );
-        println!(
-            "Tip: install a supported host runtime or pass --host <name> to apply directly."
-        );
+        println!("Tip: install a supported host runtime or pass --host <name> to apply directly.");
     }
 }

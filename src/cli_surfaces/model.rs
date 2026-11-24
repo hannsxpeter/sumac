@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const PROFILE_SCHEMA: &str = "sxmc_cli_surface_profile_v1";
 pub const CLI_AI_HOSTS_LAST_VERIFIED: &str = "2026-03-21";
@@ -69,19 +70,128 @@ pub struct ProfileSubcommand {
     pub confidence: ConfidenceLevel,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionRequirementSource {
+    UsageCompulsory,
+    UsageOptional,
+    UsageAmbiguous,
+    OptionMarker,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProfileOption {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub short: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_name: Option<String>,
-    #[serde(default)]
     pub required: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_known: bool,
+    pub required_source: Option<OptionRequirementSource>,
     pub summary: Option<String>,
-    #[serde(default)]
     pub confidence: ConfidenceLevel,
+}
+
+impl ProfileOption {
+    /// Returns `Some(true|false)` only when requiredness is backed by usage/marker
+    /// evidence or an explicit legacy boolean; `None` when omitted or ambiguous.
+    pub fn known_required(&self) -> Option<bool> {
+        if self.required_source == Some(OptionRequirementSource::UsageAmbiguous) {
+            return None;
+        }
+        if self.required_known || self.required || self.required_source.is_some() {
+            Some(self.required)
+        } else {
+            None
+        }
+    }
+}
+
+impl Serialize for ProfileOption {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let known_req = self.known_required();
+        let mut field_count = 2; // name + confidence
+        if self.short.is_some() {
+            field_count += 1;
+        }
+        if self.value_name.is_some() {
+            field_count += 1;
+        }
+        if known_req.is_some() {
+            field_count += 1;
+        }
+        if self.required_source.is_some() {
+            field_count += 1;
+        }
+        if self.summary.is_some() {
+            field_count += 1;
+        }
+        let mut state = serializer.serialize_struct("ProfileOption", field_count)?;
+        state.serialize_field("name", &self.name)?;
+        if let Some(short) = &self.short {
+            state.serialize_field("short", short)?;
+        }
+        if let Some(value_name) = &self.value_name {
+            state.serialize_field("value_name", value_name)?;
+        }
+        if let Some(req) = known_req {
+            state.serialize_field("required", &req)?;
+        }
+        if let Some(source) = &self.required_source {
+            state.serialize_field("required_source", source)?;
+        }
+        if let Some(summary) = &self.summary {
+            state.serialize_field("summary", summary)?;
+        }
+        state.serialize_field("confidence", &self.confidence)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+struct RawProfileOption {
+    name: String,
+    #[serde(default)]
+    short: Option<String>,
+    #[serde(default)]
+    value_name: Option<String>,
+    #[serde(default)]
+    required: Option<bool>,
+    #[serde(default)]
+    required_source: Option<OptionRequirementSource>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    confidence: ConfidenceLevel,
+}
+
+impl<'de> Deserialize<'de> for ProfileOption {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawProfileOption::deserialize(deserializer)?;
+        let (required, required_known) = match raw.required_source {
+            Some(OptionRequirementSource::UsageAmbiguous) => (false, false),
+            _ => match raw.required {
+                Some(req) => (req, true),
+                None => match raw.required_source {
+                    Some(
+                        OptionRequirementSource::UsageCompulsory
+                        | OptionRequirementSource::OptionMarker,
+                    ) => (true, true),
+                    Some(OptionRequirementSource::UsageOptional) => (false, true),
+                    Some(OptionRequirementSource::UsageAmbiguous) | None => (false, false),
+                },
+            },
+        };
+        Ok(Self {
+            name: raw.name,
+            short: raw.short,
+            value_name: raw.value_name,
+            required,
+            required_known,
+            required_source: raw.required_source,
+            summary: raw.summary,
+            confidence: raw.confidence,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,7 +521,7 @@ pub const AI_HOST_SPECS: &[HostProfileSpec] = &[
         label: "OpenAI/Codex",
         sidecar_scope: "openai-codex",
         native_doc_target: Some("AGENTS.md"),
-        native_config_target: Some(".codex/mcp.toml"),
+        native_config_target: Some(".codex/config.toml"),
         config_shape: Some(ConfigShape::TomlMcpServers),
         official_reference_url: "https://developers.openai.com/codex/cli/",
     },

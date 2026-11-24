@@ -103,6 +103,8 @@ pub mod auth;
 pub mod bake;
 /// Lightweight filesystem cache utilities.
 pub mod cache;
+/// Deterministic local workflow checks for project manifests.
+pub mod check;
 /// CLI inspection and CLI->AI surface generation helpers.
 pub mod cli_surfaces;
 /// MCP, OpenAPI, and GraphQL client adapters.

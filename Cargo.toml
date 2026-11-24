@@ -1,6 +1,6 @@
 [package]
 name = "sxmc"
-version = "1.0.10"
+version = "1.2.0"
 edition = "2021"
 description = "Sumac: bring out what your tools can do — bridge skills, MCP, and APIs into reusable agent, terminal, and automation workflows"
 license = "MIT"
@@ -30,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
+toml_edit = "0.22"
 
 # Async
 tokio = { version = "1", features = ["full"] }

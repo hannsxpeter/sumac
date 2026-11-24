@@ -117,7 +117,9 @@ pub fn install_skill(request: SkillInstallRequest<'_>) -> Result<SkillInstallRep
     let resolved = resolve_skill_source(request.source, request.repo_subpath, request.reference)?;
     let materialized = materialize_source_dir(&resolved)?;
     let parsed = parser::parse_skill(&materialized.path, request.source)?;
-    let skills_root = request.install_paths.resolve_skills_path(request.skills_path);
+    let skills_root = request
+        .install_paths
+        .resolve_skills_path(request.skills_path);
     let target_dir = skills_root.join(&parsed.name);
 
     if target_dir.exists() {
@@ -146,7 +148,9 @@ pub fn install_skill(request: SkillInstallRequest<'_>) -> Result<SkillInstallRep
 }
 
 pub fn update_skills(request: SkillUpdateRequest<'_>) -> Result<Vec<SkillInstallReport>> {
-    let skills_root = request.install_paths.resolve_skills_path(request.skills_path);
+    let skills_root = request
+        .install_paths
+        .resolve_skills_path(request.skills_path);
     if !skills_root.exists() {
         return Err(SxmcError::Other(format!(
             "No installed skills found at {}",
@@ -480,10 +484,7 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.0, "https://github.com/openai/skills.git");
         assert_eq!(parsed.1.as_deref(), Some("main"));
-        assert_eq!(
-            parsed.2.as_deref(),
-            Some("skills/.curated/example-skill")
-        );
+        assert_eq!(parsed.2.as_deref(), Some("skills/.curated/example-skill"));
     }
 
     #[test]
@@ -613,7 +614,10 @@ mod tests {
 
         assert!(report.target_dir.join("SKILL.md").exists());
         assert!(report.target_dir.join("scripts/nested/check.sh").exists());
-        assert!(report.target_dir.join("references/guides/guide.md").exists());
+        assert!(report
+            .target_dir
+            .join("references/guides/guide.md")
+            .exists());
         assert!(!report.target_dir.join("README.md").exists());
         assert!(InstalledSkillMetadata::metadata_path(&report.target_dir).exists());
     }

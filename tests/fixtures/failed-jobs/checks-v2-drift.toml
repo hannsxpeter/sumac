@@ -1,0 +1,15 @@
+version = 1
+
+[[checks]]
+name = "failed-jobs-v2-drift"
+argv = ["python3", "list_failed_jobs.py", "--mode", "v2-drift"]
+expect_exit = 0
+
+[checks.json_types]
+"/failed_count" = "integer"
+"/failed_job_ids" = "array"
+"/last_error" = "null"
+
+[checks.json_equals]
+"/failed_count" = 1
+"/failed_job_ids" = ["job-17"]

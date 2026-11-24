@@ -85,11 +85,7 @@ fn sync_exit_outcome(value: &Value, apply: bool, check: bool) -> CommandOutcome 
     }
 }
 
-fn render_sync_value(
-    value: &Value,
-    pretty: bool,
-    format: Option<output::StructuredOutputFormat>,
-) {
+fn render_sync_value(value: &Value, pretty: bool, format: Option<output::StructuredOutputFormat>) {
     if let Some(format) = explicit_structured_format(format, pretty) {
         println!("{}", output::format_structured_value(value, format));
     } else {

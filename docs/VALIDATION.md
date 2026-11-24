@@ -63,6 +63,7 @@ The maintained product coverage now centers on three layers:
 - portable cross-platform smoke via `scripts/smoke_portable_core.sh`
 - portable fixture-based MCP smoke via `scripts/smoke_portable_fixtures.sh`
 - optional real-world MCP smoke via `scripts/smoke_real_world_mcps.sh`
+- optional Codex app-server host smoke via `scripts/smoke_codex_app_server.sh` (discovers and calls a harmless fixture MCP tool without an LLM turn, isolated to temp files)
 - generated fixture inventory via `scripts/fixture_inventory.py`
 
 High-value scenarios covered in this stack include:

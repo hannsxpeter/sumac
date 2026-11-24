@@ -48,6 +48,13 @@ pub fn config_dir() -> PathBuf {
     base_config_home().join("sxmc")
 }
 
+pub fn codex_home_dir() -> PathBuf {
+    if let Some(dir) = env_path("CODEX_HOME") {
+        return dir;
+    }
+    home_dir().join(".codex")
+}
+
 pub fn cache_dir() -> PathBuf {
     if let Some(dir) = env_path("SXMC_CACHE_HOME") {
         return dir;
@@ -167,6 +174,18 @@ impl InstallPaths {
         }
     }
 
+    pub fn legacy_host_config_path(&self, client: AiClientProfile) -> Option<PathBuf> {
+        match (self.scope, client) {
+            (InstallScope::Local, AiClientProfile::OpenaiCodex) => {
+                Some(self.project_root.join(".codex").join("mcp.toml"))
+            }
+            (InstallScope::Global, AiClientProfile::OpenaiCodex) => {
+                Some(codex_home_dir().join("mcp.toml"))
+            }
+            _ => None,
+        }
+    }
+
     pub fn resolve_skills_path(&self, skills_path: &Path) -> PathBuf {
         if skills_path.is_absolute() {
             return skills_path.to_path_buf();
@@ -235,7 +254,7 @@ fn local_host_config_target(client: AiClientProfile) -> Option<&'static str> {
         AiClientProfile::JetbrainsAiAssistant => None,
         AiClientProfile::Junie => None,
         AiClientProfile::Windsurf => None,
-        AiClientProfile::OpenaiCodex => Some(".codex/mcp.toml"),
+        AiClientProfile::OpenaiCodex => Some(".codex/config.toml"),
         AiClientProfile::GenericStdioMcp => Some(".sxmc/ai/generic-stdio-mcp.json"),
         AiClientProfile::GenericHttpMcp => Some(".sxmc/ai/generic-http-mcp.json"),
     }
@@ -257,7 +276,7 @@ fn global_host_doc_path(client: AiClientProfile) -> Option<PathBuf> {
             .join("sxmc-cli-ai.md"),
         AiClientProfile::Junie => home.join(".junie").join("guidelines.md"),
         AiClientProfile::Windsurf => home.join(".windsurf").join("rules").join("sxmc-cli-ai.md"),
-        AiClientProfile::OpenaiCodex => home.join(".codex").join("AGENTS.md"),
+        AiClientProfile::OpenaiCodex => codex_home_dir().join("AGENTS.md"),
         AiClientProfile::GenericStdioMcp | AiClientProfile::GenericHttpMcp => {
             config_dir().join("AGENTS.md")
         }
@@ -277,7 +296,7 @@ fn global_host_config_path(client: AiClientProfile) -> Option<PathBuf> {
         AiClientProfile::JetbrainsAiAssistant => None,
         AiClientProfile::Junie => None,
         AiClientProfile::Windsurf => None,
-        AiClientProfile::OpenaiCodex => Some(home.join(".codex").join("mcp.toml")),
+        AiClientProfile::OpenaiCodex => Some(codex_home_dir().join("config.toml")),
         AiClientProfile::GenericStdioMcp => {
             Some(config_dir().join("ai").join("generic-stdio-mcp.json"))
         }

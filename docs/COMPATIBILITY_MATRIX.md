@@ -57,7 +57,7 @@ official references listed below.
 | JetBrains AI Assistant | `.aiassistant/rules/sxmc-cli-ai.md` | none | Yes | native rules doc only | [JetBrains AI Assistant docs](https://www.jetbrains.com/help/ai-assistant/configure-project-rules.html) |
 | Junie | `.junie/guidelines.md` | none | Yes | native guidelines doc only | [Junie docs](https://www.jetbrains.com/help/junie/customize-guidelines.html) |
 | Windsurf | `.windsurf/rules/sxmc-cli-ai.md` | none | Yes | native rules doc only | [Windsurf docs](https://docs.windsurf.com/windsurf/cascade/memories) |
-| OpenAI/Codex | `AGENTS.md` portable fallback | `.codex/mcp.toml` | Yes | managed TOML block for config | [Codex docs](https://developers.openai.com/codex/cli/) |
+| OpenAI/Codex | `AGENTS.md` portable fallback | `.codex/config.toml` | Yes | preserves existing TOML, managed block for `sxmc` entries | [Codex docs](https://developers.openai.com/codex/cli/) |
 | Generic stdio MCP | `AGENTS.md` portable fallback | `.sxmc/ai/generic-stdio-mcp.json` | Yes | sidecar config only | [MCP architecture](https://modelcontextprotocol.io/docs/learn/architecture) |
 | Generic HTTP MCP | `AGENTS.md` portable fallback | `.sxmc/ai/generic-http-mcp.json` | Yes | sidecar config only | [MCP architecture](https://modelcontextprotocol.io/docs/learn/architecture) |
 
@@ -65,6 +65,7 @@ official references listed below.
 
 - `AGENTS.md` is the portable baseline, not the only target.
 - `setup`, `add`, `init ai`, `doctor`, `status`, `sync`, and `watch` support both project-local writes (default / `--local`) and user-level host installs (`--global`).
+- For OpenAI/Codex, project-local writes target `.codex/config.toml` and `--global` writes target `$CODEX_HOME/config.toml` (falling back to `~/.codex/config.toml`) and `$CODEX_HOME/AGENTS.md`. Existing valid TOML settings, comments, and unmanaged `[mcp_servers.*]` entries are preserved; unmanaged entries with conflicting server names are refused rather than overwritten, and any legacy `.codex/mcp.toml` or legacy sidecars are left untouched for inspection.
 - `setup` and `add` now auto-detect supported hosts from either existing
   managed host files or installed runtimes such as `claude`, `gemini`,
   `opencode`, and `codex`.

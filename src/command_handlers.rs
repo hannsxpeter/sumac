@@ -97,10 +97,7 @@ pub fn cmd_skills_list(paths: &[PathBuf], options: SkillListOptions<'_>) -> Resu
                 });
                 if let Some(metadata) = metadata {
                     if let Some(object) = value.as_object_mut() {
-                        object.insert(
-                            "managed".to_string(),
-                            serde_json::Value::Bool(true),
-                        );
+                        object.insert("managed".to_string(), serde_json::Value::Bool(true));
                         object.insert(
                             "install_scope".to_string(),
                             serde_json::Value::String(metadata.install_scope.clone()),
@@ -116,10 +113,7 @@ pub fn cmd_skills_list(paths: &[PathBuf], options: SkillListOptions<'_>) -> Resu
                     }
                 } else if options.installed_only {
                     if let Some(object) = value.as_object_mut() {
-                        object.insert(
-                            "managed".to_string(),
-                            serde_json::Value::Bool(false),
-                        );
+                        object.insert("managed".to_string(), serde_json::Value::Bool(false));
                         object.insert(
                             "update_status".to_string(),
                             serde_json::Value::String("unmanaged".to_string()),

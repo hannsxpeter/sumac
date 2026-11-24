@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use sxmc::check::{CheckOutputFormat, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT_SECONDS};
 use sxmc::cli_surfaces::{AiClientProfile, AiCoverage, ArtifactMode};
 use sxmc::output;
 
@@ -1134,6 +1135,37 @@ pub enum Commands {
         /// Structured output format
         #[arg(long, value_enum)]
         format: Option<output::StructuredOutputFormat>,
+    },
+
+    /// Run deterministic local workflow checks from .sxmc/checks.toml
+    Check {
+        /// Project root containing .sxmc/checks.toml (defaults to current working directory)
+        #[arg(long)]
+        root: Option<PathBuf>,
+
+        /// Explicit manifest path (defaults to <root>/.sxmc/checks.toml)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Output format (human or json)
+        #[arg(long, value_enum, default_value = "human")]
+        format: CheckOutputFormat,
+
+        /// Per-check execution timeout in seconds
+        #[arg(
+            long = "timeout-seconds",
+            value_name = "SECONDS",
+            default_value_t = DEFAULT_TIMEOUT_SECONDS
+        )]
+        timeout_seconds: u64,
+
+        /// Maximum stdout/stderr bytes captured per check before terminating the child
+        #[arg(
+            long = "max-output-bytes",
+            value_name = "BYTES",
+            default_value_t = DEFAULT_MAX_OUTPUT_BYTES
+        )]
+        max_output_bytes: usize,
     },
 }
 

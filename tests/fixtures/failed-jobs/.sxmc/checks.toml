@@ -1,0 +1,20 @@
+version = 1
+
+[[checks]]
+name = "failed-jobs-v1"
+argv = ["python3", "list_failed_jobs.py", "--mode", "v1"]
+expect_exit = 0
+
+[checks.json_types]
+"/failed_count" = "integer"
+"/failed_job_ids" = "array"
+"/failed_job_ids/0" = "string"
+"/last_error" = "null"
+"/meta~1schema" = "string"
+"/meta~0source" = "string"
+
+[checks.json_equals]
+"/failed_count" = 1
+"/failed_job_ids" = ["job-17"]
+"/meta~1schema" = "v1"
+"/meta~0source" = "fake_jobs_cli"

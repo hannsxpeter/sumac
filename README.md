@@ -236,7 +236,19 @@ See:
 - `sxmc inspect cache-stats`: inspect cached profile inventory and size
 - `sxmc inspect cache-invalidate` / `sxmc inspect cache-clear`: selectively invalidate or fully reset cached CLI profiles
 - `sxmc bake`: saved connections
+- `sxmc check`: run deterministic local workflow checks from `.sxmc/checks.toml`
 - `sxmc completions`: shell completion generation
+
+### Workflow Checks (`sxmc check`)
+
+Verify trusted project-local CLI workflows against `.sxmc/checks.toml` with
+exact `argv` execution, bounded runtime/output, exit-code checks, and strict
+RFC 6901 JSON Pointer assertions:
+
+```bash
+sxmc check --root "tests/fixtures/failed-jobs"
+sxmc check --root "tests/fixtures/failed-jobs" --format json
+```
 
 ## Safety and Reliability
 

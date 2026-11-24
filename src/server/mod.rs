@@ -1006,19 +1006,11 @@ mod tests {
             "---\nname: watched-skill\ndescription: test\n---\nHello\n",
         )
         .unwrap();
-        fs::write(
-            skill_dir.join("references/guides/guide.md"),
-            "# First\n",
-        )
-        .unwrap();
+        fs::write(skill_dir.join("references/guides/guide.md"), "# First\n").unwrap();
 
         let paths = vec![temp.path().to_path_buf()];
         let before = compute_skill_fingerprint(&paths, &[], &[]);
-        fs::write(
-            skill_dir.join("references/guides/guide.md"),
-            "# Second\n",
-        )
-        .unwrap();
+        fs::write(skill_dir.join("references/guides/guide.md"), "# Second\n").unwrap();
         let after = compute_skill_fingerprint(&paths, &[], &[]);
 
         assert_ne!(before, after);
