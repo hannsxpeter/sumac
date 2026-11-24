@@ -1670,7 +1670,19 @@ for cmd in "${MATRIX_CLIS[@]}"; do
     ai_cmd+=( --allow-low-confidence )
   fi
   ai_out=$("${ai_cmd[@]}" 2>&1)
-  grep -q "Target:" <<<"$ai_out" && pass "$cmd: init ai claude-code" || fail "$cmd: init ai"
+  ai_status=$?
+  if [[ "$cmd" == find && "$IS_WINDOWS" -eq 0 && "$ai_status" -ne 0 &&
+        "$ai_out" == *"Refusing to generate startup-facing agent docs from a low-confidence CLI profile."* &&
+        "$ai_out" == *"Use --allow-low-confidence"* ]] && ! grep -q '^Target:' <<<"$ai_out"; then
+    pass "$cmd: init ai refuses a low-confidence profile"
+    ai_out=$("${ai_cmd[@]}" --allow-low-confidence 2>&1)
+    ai_status=$?
+  fi
+  if [ "$ai_status" -eq 0 ] && grep -q '^Target:' <<<"$ai_out"; then
+    pass "$cmd: init ai claude-code"
+  else
+    fail "$cmd: init ai" "Exit $ai_status"$'\n'"$ai_out"
+  fi
 
   ((CLI_PASS++))
 done
